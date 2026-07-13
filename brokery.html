@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Трекер: Брокеры</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+/* ===== Адаптер хранилища: Telegram CloudStorage / localStorage ===== */
+(function(){
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var useCloud = !!(tg && tg.CloudStorage && tg.initData && tg.initData.length > 0);
+
+  if (tg) {
+    try { tg.ready(); tg.expand(); } catch(e){}
+    try {
+      tg.BackButton.show();
+      tg.BackButton.onClick(function(){ location.href = 'index.html'; });
+    } catch(e){}
+  }
+
+  var CHUNK = 1500; /* запас под лимит 4096 символов на ключ */
+
+  function san(k){ return String(k).replace(/[^A-Za-z0-9_-]/g, '_'); }
+
+  function cs(method){
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function(resolve, reject){
+      args.push(function(err, val){ if (err) reject(err); else resolve(val); });
+      tg.CloudStorage[method].apply(tg.CloudStorage, args);
+    });
+  }
+
+  /* --- локальное хранилище (резерв и работа вне Телеграма) --- */
+  var localApi = {
+    get: function(key){
+      var v = localStorage.getItem('st_' + key);
+      return Promise.resolve(v === null ? null : { key: key, value: v, shared: false });
+    },
+    set: function(key, value){
+      localStorage.setItem('st_' + key, String(value));
+      return Promise.resolve({ key: key, value: String(value), shared: false });
+    },
+    "delete": function(key){
+      localStorage.removeItem('st_' + key);
+      return Promise.resolve({ key: key, deleted: true, shared: false });
+    },
+    list: function(prefix){
+      var keys = [];
+      for (var i = 0; i < localStorage.length; i++){
+        var k = localStorage.key(i);
+        if (k && k.indexOf('st_') === 0){
+          var ok = k.slice(3);
+          if (!prefix || ok.indexOf(prefix) === 0) keys.push(ok);
+        }
+      }
+      return Promise.resolve({ keys: keys, shared: false });
+    }
+  };
+
+  /* --- облако Телеграма с разбиением на части --- */
+  var cloudApi = {
+    get: async function(key){
+      var s = san(key);
+      var metaObj = await cs('getItems', ['m_' + s]);
+      var meta = metaObj['m_' + s];
+      if (!meta){
+        /* в облаке пусто — пробуем локальную копию */
+        return localApi.get(key);
+      }
+      var n = parseInt(meta, 10) || 1;
+      var keys = [];
+      for (var i = 0; i < n; i++) keys.push('c_' + s + '_' + i);
+      var parts = await cs('getItems', keys);
+      var out = '';
+      for (var j = 0; j < n; j++) out += (parts['c_' + s + '_' + j] || '');
+      return { key: key, value: out, shared: false };
+    },
+    set: async function(key, value){
+      var s = san(key);
+      value = String(value);
+      var n = Math.max(1, Math.ceil(value.length / CHUNK));
+      var old = 0;
+      try {
+        var mo = await cs('getItems', ['m_' + s]);
+        old = parseInt(mo['m_' + s], 10) || 0;
+      } catch(e){}
+      for (var i = 0; i < n; i++){
+        await cs('setItem', 'c_' + s + '_' + i, value.substr(i * CHUNK, CHUNK));
+      }
+      await cs('setItem', 'm_' + s, n + '|' + key);
+      if (old > n){
+        var rm = [];
+        for (var j = n; j < old; j++) rm.push('c_' + s + '_' + j);
+        try { await cs('removeItems', rm); } catch(e){}
+      }
+      /* локальная резервная копия */
+      try { localStorage.setItem('st_' + key, value); } catch(e){}
+      return { key: key, value: value, shared: false };
+    },
+    "delete": async function(key){
+      var s = san(key);
+      var mo = await cs('getItems', ['m_' + s]);
+      var n = parseInt(mo['m_' + s], 10) || 0;
+      var rm = ['m_' + s];
+      for (var i = 0; i < n; i++) rm.push('c_' + s + '_' + i);
+      await cs('removeItems', rm);
+      try { localStorage.removeItem('st_' + key); } catch(e){}
+      return { key: key, deleted: true, shared: false };
+    },
+    list: async function(prefix){
+      var all = await cs('getKeys');
+      var metas = [];
+      for (var i = 0; i < all.length; i++){
+        if (all[i].indexOf('m_') === 0) metas.push(all[i]);
+      }
+      var keys = [];
+      if (metas.length){
+        var vals = await cs('getItems', metas);
+        for (var k in vals){
+          var v = vals[k] || '';
+          var p = v.indexOf('|');
+          var orig = p >= 0 ? v.slice(p + 1) : k.slice(2);
+          if (!prefix || orig.indexOf(prefix) === 0) keys.push(orig);
+        }
+      }
+      return { keys: keys, shared: false };
+    }
+  };
+
+  if (!window.storage){
+    window.storage = useCloud ? cloudApi : localApi;
+  }
+
+  /* ===== Панель: перенос данных (экспорт / импорт) ===== */
+  function buildPanel(){
+    var css = document.createElement('style');
+    css.textContent =
+      '#syncBtn{position:fixed;left:12px;bottom:12px;z-index:9998;width:40px;height:40px;border-radius:50%;' +
+      'border:1px solid #E2E6EC;background:#fff;color:#1C4E80;font-size:17px;cursor:pointer;' +
+      'box-shadow:0 2px 8px rgba(22,35,58,.12);display:flex;align-items:center;justify-content:center;}' +
+      '#syncOverlay{position:fixed;inset:0;background:rgba(22,35,58,.45);z-index:9999;display:none;' +
+      'align-items:flex-end;justify-content:center;}' +
+      '#syncOverlay.open{display:flex;}' +
+      '#syncPanel{background:#fff;border-radius:16px 16px 0 0;width:100%;max-width:520px;padding:16px;' +
+      'font-family:"IBM Plex Sans",-apple-system,sans-serif;color:#16233A;}' +
+      '#syncPanel h3{margin:0 0 10px;font-size:15px;}' +
+      '#syncPanel textarea{width:100%;height:130px;border:1px solid #E2E6EC;border-radius:10px;padding:9px;' +
+      'font-family:"IBM Plex Mono",monospace;font-size:11px;box-sizing:border-box;resize:vertical;}' +
+      '#syncPanel .row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;}' +
+      '#syncPanel button{flex:1;min-width:120px;padding:10px;border-radius:10px;border:1px solid #E2E6EC;' +
+      'background:#fff;font-size:13px;font-weight:600;cursor:pointer;color:#16233A;}' +
+      '#syncPanel button.primary{background:#1C4E80;color:#fff;border-color:#1C4E80;}' +
+      '#syncPanel .home{display:block;text-align:center;margin-top:12px;font-size:13px;color:#1C4E80;' +
+      'text-decoration:none;font-weight:600;}' +
+      '#syncPanel .hint{font-size:11.5px;color:#647089;margin:6px 0 0;}';
+    document.head.appendChild(css);
+
+    var btn = document.createElement('button');
+    btn.id = 'syncBtn';
+    btn.type = 'button';
+    btn.title = 'Данные';
+    btn.textContent = '\u21C5';
+    document.body.appendChild(btn);
+
+    var overlay = document.createElement('div');
+    overlay.id = 'syncOverlay';
+    overlay.innerHTML =
+      '<div id="syncPanel">' +
+        '<h3>Перенос данных</h3>' +
+        '<textarea id="syncArea" placeholder="Здесь появятся данные при выгрузке. Для загрузки — вставьте сюда данные и нажмите \u00ABЗагрузить\u00BB."></textarea>' +
+        '<div class="row">' +
+          '<button type="button" id="syncExport">Выгрузить данные</button>' +
+          '<button type="button" id="syncImport" class="primary">Загрузить данные</button>' +
+        '</div>' +
+        '<div class="row"><button type="button" id="syncClose">Закрыть</button></div>' +
+        '<p class="hint" id="syncHint">Хранилище: ' + (useCloud ? 'облако Телеграма' : 'память браузера') + '</p>' +
+        '<a class="home" href="index.html">\u2190 К выбору списка</a>' +
+      '</div>';
+    document.body.appendChild(overlay);
+
+    var area = overlay.querySelector('#syncArea');
+    var hint = overlay.querySelector('#syncHint');
+
+    btn.addEventListener('click', function(){ overlay.classList.add('open'); });
+    overlay.querySelector('#syncClose').addEventListener('click', function(){ overlay.classList.remove('open'); });
+    overlay.addEventListener('click', function(e){ if (e.target === overlay) overlay.classList.remove('open'); });
+
+    overlay.querySelector('#syncExport').addEventListener('click', function(){
+      window.storage.list('').then(function(res){
+        var keys = (res && res.keys) || [];
+        if (!keys.length){ area.value = '{}'; hint.textContent = 'Данных пока нет.'; return; }
+        var dump = {};
+        var chain = Promise.resolve();
+        keys.forEach(function(k){
+          chain = chain.then(function(){
+            return window.storage.get(k).then(function(r){ if (r) dump[k] = r.value; });
+          });
+        });
+        chain.then(function(){
+          area.value = JSON.stringify(dump);
+          area.select();
+          try { document.execCommand('copy'); hint.textContent = 'Данные выгружены и скопированы в буфер.'; }
+          catch(e){ hint.textContent = 'Данные выгружены — скопируйте текст вручную.'; }
+        });
+      });
+    });
+
+    overlay.querySelector('#syncImport').addEventListener('click', function(){
+      var txt = area.value.trim();
+      if (!txt){ hint.textContent = 'Поле пустое — вставьте данные для загрузки.'; return; }
+      var data;
+      try { data = JSON.parse(txt); }
+      catch(e){ hint.textContent = 'Не удалось прочитать данные: проверьте, что вставлен весь текст целиком.'; return; }
+      var keys = Object.keys(data);
+      if (!keys.length){ hint.textContent = 'В данных нет записей.'; return; }
+      hint.textContent = 'Загружаю\u2026';
+      var chain = Promise.resolve();
+      keys.forEach(function(k){
+        chain = chain.then(function(){ return window.storage.set(k, data[k]); });
+      });
+      chain.then(function(){
+        hint.textContent = 'Готово. Обновляю страницу\u2026';
+        setTimeout(function(){ location.reload(); }, 600);
+      }).catch(function(){
+        hint.textContent = 'Часть данных не загрузилась — попробуйте ещё раз.';
+      });
+    });
+  }
+
+  if (document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', buildPanel);
+  } else {
+    buildPanel();
+  }
+})();
+
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #F2F4F6;
+    --card: #FFFFFF;
+    --ink: #16233A;
+    --ink-soft: #647089;
+    --border: #E2E6EC;
+    --accent: #1C4E80;
+    --accent-soft: #E4ECF4;
+    --stamp: #B23A2E;
+    --good: #2F8F5B;
+    --good-soft: #E4F3EA;
+    --amber: #C9862B;
+    --amber-soft: #FBF0DF;
+    --purple: #6A4FB3;
+    --purple-soft: #ECE7F8;
+    --gray: #8A8F99;
+    --gray-soft: #ECEDEF;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg); color:var(--ink);
+    font-family:'IBM Plex Sans', -apple-system, sans-serif;
+    min-height:100vh; -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:'IBM Plex Mono', monospace;}
+  #app{max-width:520px;margin:0 auto;padding:16px 14px 90px;}
+
+  header.top{ display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  header.top h1{ font-size:18px; margin:0; font-weight:700; letter-spacing:-0.01em; }
+  header.top .sub{ font-size:11.5px; color:var(--ink-soft); margin-top:2px; }
+  .badge-total{
+    font-family:'IBM Plex Mono', monospace; font-size:11px; background:var(--accent-soft); color:var(--accent);
+    padding:4px 9px; border-radius:20px; font-weight:600; white-space:nowrap;
+  }
+
+  .tabbar{ display:flex; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:3px; margin-bottom:14px; }
+  .tabbar button{
+    flex:1; border:none; background:none; padding:9px 4px; font-size:13px; font-weight:600;
+    color:var(--ink-soft); border-radius:9px; cursor:pointer; font-family:'IBM Plex Sans',sans-serif;
+  }
+  .tabbar button.active{ background:var(--accent); color:#fff; }
+
+  .view{ display:none; }
+  .view.active{ display:block; }
+
+  /* --- day view --- */
+  .daynav{ display:flex; align-items:center; gap:8px; background:var(--card); border:1px solid var(--border); border-radius:14px; padding:10px 12px; margin-bottom:12px; }
+  .queue-toggle{ display:flex; gap:8px; margin-bottom:10px; }
+  .qt-btn{
+    flex:1; border:1.5px solid var(--border); background:var(--card); color:var(--ink-soft);
+    border-radius:12px; padding:12px 8px; font-size:13px; font-weight:700; cursor:pointer;
+    font-family:'IBM Plex Sans',sans-serif; display:flex; align-items:center; justify-content:center; gap:6px;
+  }
+  .qt-btn .mono{ font-size:11.5px; opacity:.85; }
+  .qt-btn.active{ background:var(--accent); border-color:var(--accent); color:#fff; }
+  .substatus-row{ margin-bottom:12px; }
+  .substatus-row .status-select{ width:100%; }
+  .daynav button.arrow{ width:34px; height:34px; border-radius:10px; border:1px solid var(--border); background:#fff; color:var(--ink); font-size:16px; cursor:pointer; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+  .daynav button.arrow:active{ background:var(--bg); }
+  .daynav .center{ flex:1; text-align:center; }
+  .daynav .daylabel{ font-weight:700; font-size:14px; }
+  .daynav .datelabel{ font-size:11.5px; color:var(--ink-soft); font-family:'IBM Plex Mono',monospace; margin-top:1px;}
+  .daynav .today-btn{ font-size:11px; font-family:'IBM Plex Mono',monospace; color:var(--accent); background:var(--accent-soft); border:none; border-radius:8px; padding:6px 8px; cursor:pointer; font-weight:600; flex-shrink:0; }
+
+  .progress-wrap{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:12px 14px; margin-bottom:14px; }
+  .progress-row{ display:flex; justify-content:space-between; align-items:baseline; margin-bottom:7px;}
+  .progress-row .label{ font-size:12.5px; color:var(--ink-soft); }
+  .progress-row .count{ font-family:'IBM Plex Mono',monospace; font-weight:700; font-size:13px; }
+  .bar{ height:7px; background:var(--bg); border-radius:5px; overflow:hidden; }
+  .bar-fill{ height:100%; background:var(--accent); border-radius:5px; transition:width .3s ease; }
+  .day-jump{ display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--ink-soft); font-family:'IBM Plex Mono',monospace; margin-top:6px; }
+  .day-jump input{ width:52px; border:1px solid var(--border); border-radius:7px; padding:4px 6px; font-family:'IBM Plex Mono',monospace; font-size:12px; text-align:center; }
+
+  .cards{ display:flex; flex-direction:column; gap:12px; }
+  .card{ position:relative; background:var(--card); border:1px solid var(--border); border-radius:16px; padding:14px 14px 12px; overflow:hidden; }
+  .card.card-dim{ opacity:.55; }
+  .card-top{ display:flex; justify-content:space-between; align-items:flex-start; gap:8px; margin-bottom:8px;}
+  .seller{ font-weight:700; font-size:15px; line-height:1.25; }
+  .meta{ font-size:12px; color:var(--ink-soft); margin-top:2px; }
+  .views{ font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--ink-soft); background:var(--bg); border-radius:8px; padding:3px 7px; white-space:nowrap; flex-shrink:0; }
+  .offer-tag{ display:inline-block; font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--accent); background:var(--accent-soft); padding:3px 8px; border-radius:7px; font-weight:600; margin-bottom:10px; letter-spacing:.02em; }
+  .btn-row{ display:flex; gap:8px; margin-top:2px; }
+  .btn{ flex:1; text-align:center; text-decoration:none; border:none; cursor:pointer; border-radius:10px; padding:10px 8px; font-size:13px; font-weight:600; font-family:'IBM Plex Sans',sans-serif; display:flex; align-items:center; justify-content:center; gap:5px; }
+  .btn-open{ background:var(--accent); color:#fff; }
+  .btn-open:active{ opacity:.85; }
+  .btn-copy{ background:var(--bg); color:var(--ink); border:1px solid var(--border); }
+  .btn-copy:active{ background:#e9ebef; }
+
+  .texttype-row{ display:flex; gap:8px; margin-top:10px; }
+  select.texttype-select{
+    flex:1.3; appearance:none; -webkit-appearance:none; border-radius:10px; border:1.5px solid var(--border);
+    padding:9px 30px 9px 10px; font-size:12.5px; font-weight:600; font-family:'IBM Plex Sans',sans-serif;
+    background:#fff url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"><path d="M0 0l5 6 5-6z" fill="%23647089"/></svg>') no-repeat right 10px center;
+    color:var(--ink);
+  }
+  .btn-copytext{ flex:1; background:var(--accent); color:#fff; border:none; border-radius:10px; padding:9px 8px; font-size:12.5px; font-weight:700; cursor:pointer; font-family:'IBM Plex Sans',sans-serif; }
+  .btn-copytext:active{ opacity:.85; }
+
+  .call-row{ display:flex; gap:8px; margin-top:8px; }
+  .btn-call{
+    width:100%; background:#fff; color:var(--purple); border:1.5px solid var(--purple);
+    border-radius:10px; padding:9px; font-size:12.5px; font-weight:700; cursor:pointer; font-family:'IBM Plex Sans',sans-serif;
+  }
+  .btn-call.active{ background:var(--purple); color:#fff; }
+  .btn-call:active{ opacity:.85; }
+  .called-note{ font-size:10.5px; color:var(--purple); margin-top:5px; font-family:'IBM Plex Mono',monospace; }
+
+  .script-step{ border-top:1px solid var(--border); padding:12px 0; font-size:13px; line-height:1.5; }
+  .script-step .ss-label{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--purple); font-weight:700; margin-bottom:5px; text-transform:uppercase; letter-spacing:.03em; }
+  .script-step .oi-copy{ margin-top:8px; font-size:12px; background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:6px 10px; cursor:pointer; font-family:'IBM Plex Sans',sans-serif; font-weight:600; }
+  .ref-subhead{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--ink-soft); font-weight:700; text-transform:uppercase; letter-spacing:.04em; padding-top:12px; }
+
+  .status-row{ display:flex; gap:8px; margin-top:10px; }
+  select.status-select{
+    flex:1; appearance:none; -webkit-appearance:none; border-radius:10px; border:1.5px solid var(--border);
+    padding:9px 30px 9px 10px; font-size:13px; font-weight:600; font-family:'IBM Plex Sans',sans-serif;
+    background:#fff url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"><path d="M0 0l5 6 5-6z" fill="%23647089"/></svg>') no-repeat right 10px center;
+    color:var(--ink);
+  }
+  input.note-input{
+    width:100%; margin-top:8px; border:1px solid var(--border); border-radius:10px; padding:9px 10px;
+    font-size:12.5px; font-family:'IBM Plex Sans',sans-serif; color:var(--ink);
+  }
+  .updated-note{ font-size:10.5px; color:var(--ink-soft); margin-top:5px; font-family:'IBM Plex Mono',monospace;}
+
+  .stamp{ position:absolute; top:8px; right:10px; transform:rotate(-9deg); border:2.5px solid var(--stamp); color:var(--stamp); font-family:'IBM Plex Mono',monospace; font-weight:700; font-size:10px; letter-spacing:.04em; padding:3px 8px; border-radius:6px; background:rgba(255,255,255,.92); pointer-events:none; }
+
+  .empty{ text-align:center; padding:50px 20px; color:var(--ink-soft); background:var(--card); border:1px solid var(--border); border-radius:16px; }
+  .empty .big{ font-size:34px; margin-bottom:8px; }
+
+  details.offers-ref{ margin-top:18px; background:var(--card); border:1px solid var(--border); border-radius:14px; padding:2px 14px; }
+  details.offers-ref summary{ cursor:pointer; padding:12px 0; font-weight:600; font-size:13.5px; list-style:none; display:flex; justify-content:space-between; align-items:center; }
+  details.offers-ref summary::-webkit-details-marker{ display:none; }
+  .offer-item{ border-top:1px solid var(--border); padding:12px 0; font-size:13px; line-height:1.5; }
+  .offer-item .oi-label{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--accent); font-weight:700; margin-bottom:5px; }
+  .offer-item .oi-copy{ margin-top:8px; font-size:12px; background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:6px 10px; cursor:pointer; font-family:'IBM Plex Sans',sans-serif; font-weight:600; }
+
+  .toast{ position:fixed; left:50%; bottom:22px; transform:translate(-50%, 20px); background:var(--ink); color:#fff; padding:10px 18px; border-radius:24px; font-size:13px; opacity:0; transition:all .25s ease; pointer-events:none; z-index:50; font-weight:500; }
+  .toast.show{ opacity:1; transform:translate(-50%,0); }
+
+  /* --- CRM view --- */
+  .search-wrap{ margin-bottom:10px; }
+  input.search-input{
+    width:100%; border:1px solid var(--border); border-radius:12px; padding:11px 14px; font-size:13.5px;
+    font-family:'IBM Plex Sans',sans-serif; background:var(--card);
+  }
+  .chips{ display:flex; gap:6px; overflow-x:auto; padding-bottom:8px; margin-bottom:10px; -webkit-overflow-scrolling:touch; }
+  .chips::-webkit-scrollbar{ display:none; }
+  .chip{
+    flex-shrink:0; font-size:12px; font-weight:600; padding:7px 12px; border-radius:20px; border:1.5px solid var(--border);
+    background:var(--card); color:var(--ink-soft); cursor:pointer; white-space:nowrap; font-family:'IBM Plex Sans',sans-serif;
+  }
+  .chip.active{ background:var(--ink); border-color:var(--ink); color:#fff; }
+
+  .crm-list{ display:flex; flex-direction:column; gap:8px; }
+  details.crm-row{ background:var(--card); border:1px solid var(--border); border-radius:14px; overflow:hidden; }
+  details.crm-row summary{
+    list-style:none; padding:12px 14px; cursor:pointer; display:flex; align-items:center; gap:10px;
+  }
+  details.crm-row summary::-webkit-details-marker{ display:none; }
+  .dot{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+  .crm-row-main{ flex:1; min-width:0; }
+  .crm-row-seller{ font-weight:700; font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .crm-row-meta{ font-size:11.5px; color:var(--ink-soft); margin-top:1px; }
+  .crm-row-badge{
+    font-family:'IBM Plex Mono',monospace; font-size:10px; font-weight:700; padding:3px 8px; border-radius:7px; flex-shrink:0;
+  }
+  .crm-detail{ padding:0 14px 14px; border-top:1px solid var(--border); padding-top:12px; }
+
+  .status-dot-new{ background:var(--gray); }
+  .status-dot-sent{ background:var(--accent); }
+  .status-dot-replied{ background:var(--amber); }
+  .status-dot-negotiating{ background:var(--purple); }
+  .status-dot-won{ background:var(--good); }
+  .status-dot-lost{ background:var(--gray); }
+  .status-dot-irrelevant{ background:var(--stamp); }
+
+  .badge-new{ background:var(--gray-soft); color:var(--gray); }
+  .badge-sent{ background:var(--accent-soft); color:var(--accent); }
+  .badge-replied{ background:var(--amber-soft); color:var(--amber); }
+  .badge-negotiating{ background:var(--purple-soft); color:var(--purple); }
+  .badge-won{ background:var(--good-soft); color:var(--good); }
+  .badge-lost{ background:var(--gray-soft); color:var(--gray); }
+  .badge-irrelevant{ background:#F5E4E2; color:var(--stamp); }
+
+  .crm-empty{ text-align:center; padding:40px 20px; color:var(--ink-soft); font-size:13px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="top">
+    <div>
+      <h1>Трекер: Брокеры</h1>
+      <div class="sub">Коллеги-брокеры · 240 контактов</div>
+    </div>
+  </header>
+
+  <div class="tabbar">
+    <button class="active" data-tab="day">Очередь</button>
+    <button data-tab="crm">CRM</button>
+  </div>
+
+  <div class="view active" id="view-day">
+    <div class="queue-toggle">
+      <button class="qt-btn active" id="qtNew">Не отправлено <span class="mono" id="qtNewCount">0</span></button>
+      <button class="qt-btn" id="qtSent">Отправлено <span class="mono" id="qtSentCount">0</span></button>
+      <button class="qt-btn" id="qtOther">Остальные <span class="mono" id="qtOtherCount">0</span></button>
+    </div>
+
+    <div class="substatus-row">
+      <select class="status-select" id="substatusSelect">
+        <option value="all">Все статусы</option>
+        <option value="new">Не написано</option>
+        <option value="sent">Написано</option>
+        <option value="replied">Ответил</option>
+        <option value="negotiating">Переговоры</option>
+        <option value="won">Договорились</option>
+        <option value="lost">Отказ</option>
+        <option value="irrelevant">Отмена</option>
+      </select>
+    </div>
+
+    <div class="cards" id="cards"></div>
+    <div class="empty" id="emptyState" style="display:none;">
+      <div class="big">🎉</div>
+      <div><b>Здесь пока пусто</b><br>по этому фильтру ничего не найдено.</div>
+    </div>
+
+    <details class="offers-ref">
+      <summary>Все тексты (оффер / крючок / TG) <span class="mono" style="font-weight:400;color:var(--ink-soft);font-size:11px;">▾</span></summary>
+      <div id="offersRef"></div>
+    </details>
+
+    <details class="offers-ref">
+      <summary>📞 Скрипт звонка <span class="mono" style="font-weight:400;color:var(--ink-soft);font-size:11px;">▾</span></summary>
+      <div id="callScriptRef"></div>
+    </details>
+  </div>
+
+  <div class="view" id="view-crm">
+    <div class="search-wrap">
+      <input type="text" class="search-input" id="searchInput" placeholder="Поиск по имени или городу...">
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="crm-list" id="crmList"></div>
+    <div class="crm-empty" id="crmEmpty" style="display:none;">Ничего не найдено</div>
+  </div>
+</div>
+
+<div class="toast" id="toast">Скопировано</div>
+
+<script>
+const DATA = [{"id":"b_0","day":1,"seller":"AMERICANCAR","contact":"","region":"Московская область","city":"Люберцы","views":236774,"link":"https://www.avito.ru/lyubertsy/predlozheniya_uslug/vostanovim_rf_uchet_zanogo_1958423405","offerIdx":0},{"id":"b_1","day":1,"seller":"Chezar Group","contact":"","region":"Северная Осетия","city":"Владикавказ","views":46688,"link":"https://www.avito.ru/vladikavkaz/predlozheniya_uslug/tamozhennyy_brokeruin_obespechenierastamozhka_avto_2531949310","offerIdx":1},{"id":"b_2","day":1,"seller":"КРД","contact":"","region":"Краснодарский край","city":"Краснодар","views":38213,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/pomosch_v_postanovke_registratsii_avto_v_gibdd_1962674890","offerIdx":2},{"id":"b_3","day":1,"seller":"Art Consalting","contact":"","region":"Москва","city":"Москва","views":34584,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/rastamozhka_armyanskie_belorusskie_avto_na_rf_sbkts_2782964669","offerIdx":3},{"id":"b_4","day":1,"seller":"AMERICANCAR","contact":"","region":"Москва","city":"Москва","views":34177,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/rastamozhka_armyanskie_belorusskie_mashiny_v_rf_2182626105","offerIdx":4},{"id":"b_5","day":2,"seller":"Грингрупп","contact":"Грингрупп","region":"Москва","city":"Москва","views":32915,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/pomosch_v_oformlenii_sbkts_i_epts_2176504531","offerIdx":0},{"id":"b_6","day":2,"seller":"Пользователь","contact":"Алексей","region":"Москва","city":"Москва","views":32731,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/bankovskaya_karta_2927245649","offerIdx":1},{"id":"b_7","day":2,"seller":"Сергей. Авто из Беларуси в РФ","contact":"","region":"Москва","city":"Москва","views":27514,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/belorusskiy_uchet_dlya_rossiyan._oformlenie_avto_v_rb_7962963567","offerIdx":2},{"id":"b_8","day":2,"seller":"Пользователь","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":26525,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/pritsep_avtodom_arenda_4519463222","offerIdx":3},{"id":"b_9","day":2,"seller":"Пользователь","contact":"","region":"Московская область","city":"Красногорск","views":25086,"link":"https://www.avito.ru/moskovskaya_oblast_krasnogorsk/predlozheniya_uslug/bez_vznosastsepkatyagachpritsepvoditelyarabota_7806156313","offerIdx":4},{"id":"b_10","day":3,"seller":"Saul Auto Import","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":22243,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/oformlenie_avto_starshe_30_let_bez_util_sbora_7861445382","offerIdx":0},{"id":"b_11","day":3,"seller":"Антон AWD GROUP","contact":"","region":"Самарская область","city":"Самара","views":16229,"link":"https://www.avito.ru/samara/predlozheniya_uslug/mazda_cx-5_2026_20l_155l.s._2wd_smart_7632714640","offerIdx":1},{"id":"b_12","day":3,"seller":"Пользователь","contact":"","region":"Приморский край","city":"Владивосток","views":16114,"link":"https://www.avito.ru/vladivostok/predlozheniya_uslug/avto_pod_zakaz-brokerskie_uslugi_2752300977","offerIdx":2},{"id":"b_13","day":3,"seller":"Алексей","contact":"","region":"Москва","city":"Москва","views":14106,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/tamozhnya_avto.util_sbor.epsm.sbkts_epts_4116635858","offerIdx":3},{"id":"b_14","day":3,"seller":"Константин","contact":"Константин","region":"Москва","city":"Москва","views":11907,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oplata_util_sbora_za_1_den_2755583544","offerIdx":4},{"id":"b_15","day":4,"seller":"Пользователь","contact":"Олег","region":"Санкт-Петербург","city":"Санкт-Петербург","views":11886,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/tamozhennoe_oformlenie_otsenka_sbkts_epts_1642827527","offerIdx":0},{"id":"b_16","day":4,"seller":"Алексей","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":11621,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/arenda_zakaz_avtobusa_mikroavtobusa_s_voditelem_40181573","offerIdx":1},{"id":"b_17","day":4,"seller":"Вячеслав","contact":"","region":"Москва","city":"Москва","views":11236,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/postanovka_avtomobilya_na_uchet_v_gibdd_7645188863","offerIdx":2},{"id":"b_18","day":4,"seller":"Евгений","contact":"","region":"Москва","city":"Москва","views":10296,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/utilizatsionnyy_sbor_utilsbor_util_sbor_3574400049","offerIdx":3},{"id":"b_19","day":4,"seller":"Пользователь","contact":"","region":"Ярославская область","city":"Рыбинск","views":9726,"link":"https://www.avito.ru/rybinsk/predlozheniya_uslug/avtomobili_s_auktsionov_yaponii_7213996440","offerIdx":4},{"id":"b_20","day":5,"seller":"SF-cars, документы для АВТО","contact":"Евгений","region":"Москва","city":"Москва","views":8748,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/laboratoriya_sbkts_epts_spisanie_util_sbora_2093576542","offerIdx":0},{"id":"b_21","day":5,"seller":"AutoPrigon","contact":"","region":"Беларусь","city":"Минск","views":8389,"link":"https://www.avito.ru/minsk/predlozheniya_uslug/avto_ekspert_belarus_3620936246","offerIdx":1},{"id":"b_22","day":5,"seller":"AMN Import Cars","contact":"","region":"Москва","city":"Москва","views":8128,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/zakaz_avtorastamozhkasbkts_eptsutilrf_uchet_2712891530","offerIdx":2},{"id":"b_23","day":5,"seller":"Saul Auto Import","contact":"","region":"Смоленская область","city":"Смоленск","views":7083,"link":"https://www.avito.ru/smolensk/predlozheniya_uslug/oformlenie_avto_starshe_30_let_bez_util_sbora_7829250358","offerIdx":3},{"id":"b_24","day":5,"seller":"Оформление Авто","contact":"","region":"Кемеровская область","city":"Новокузнецк","views":6987,"link":"https://www.avito.ru/novokuznetsk/predlozheniya_uslug/oformlenie_sbkts_epts_2663890416","offerIdx":4},{"id":"b_25","day":6,"seller":"Sergey , MakarSuperCar.","contact":"","region":"Москва","city":"Москва","views":6943,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/postanovka_avto_na_uchetregistratsiya_v_gibdd_7322997375","offerIdx":0},{"id":"b_26","day":6,"seller":"Владислав","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":6917,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/arenda_prokat_dodge_ram_5.7_s_voditelem_i_bez_7579985961","offerIdx":1},{"id":"b_27","day":6,"seller":"Пользователь","contact":"","region":"Дагестан","city":"Махачкала","views":6884,"link":"https://www.avito.ru/mahachkala/predlozheniya_uslug/pereoborudovanie_pereoformlenie_avto_7603869560","offerIdx":2},{"id":"b_28","day":6,"seller":"Auto-lab","contact":"Александр","region":"Москва","city":"Москва","views":6237,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/pereoborudovanie_avtomobilya_eptssbktsutil_2852073299","offerIdx":3},{"id":"b_29","day":6,"seller":"Данила","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":6147,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/oformlenie_sbkts_i_epts_2831431427","offerIdx":4},{"id":"b_30","day":7,"seller":"CARS SHOP ИМПОРТ АВТО ПОД КЛЮЧ","contact":"","region":"Оренбургская область","city":"Оренбург","views":5975,"link":"https://www.avito.ru/orenburg/predlozheniya_uslug/kia_seltos_7893501222","offerIdx":0},{"id":"b_31","day":7,"seller":"Пользователь","contact":"","region":"Владимирская область","city":"Александров","views":5635,"link":"https://www.avito.ru/aleksandrov/predlozheniya_uslug/vyvoz_staroy_nenuzhnoy_bytovoy_tehniki_3730614418","offerIdx":1},{"id":"b_32","day":7,"seller":"Ярослав","contact":"","region":"Алтайский край","city":"Барнаул","views":5546,"link":"https://www.avito.ru/barnaul/predlozheniya_uslug/pokupka_avto_v_yaponii._skaniruy_qr_kod_4068134189","offerIdx":2},{"id":"b_33","day":7,"seller":"Эльза","contact":"","region":"Татарстан","city":"Казань","views":5394,"link":"https://www.avito.ru/kazan/predlozheniya_uslug/arenda_pritsepa_kempera_kategoriya_v_7456393756","offerIdx":3},{"id":"b_34","day":7,"seller":"Евгений RF AUTO","contact":"","region":"Москва","city":"Москва","views":5186,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/tamozhennyy_broker_rastamozhka_avto_v_rf_i_rb_4101890620","offerIdx":4},{"id":"b_35","day":8,"seller":"Сергей","contact":"","region":"Москва","city":"Москва","views":5145,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/elektronnyy_pasport_samohodnoy_mashiny_4244351469","offerIdx":0},{"id":"b_36","day":8,"seller":"Elpts-Lab/ totauto","contact":"","region":"Московская область","city":"Балашиха","views":4746,"link":"https://www.avito.ru/balashiha/predlozheniya_uslug/tamozhennoe_oformlenie_v_rfrbkgtamozhennyy_broker_4197442786","offerIdx":1},{"id":"b_37","day":8,"seller":"Пользователь","contact":"","region":"Оренбургская область","city":"Орск","views":4679,"link":"https://www.avito.ru/orsk/predlozheniya_uslug/avtoinstruktor_2727476896","offerIdx":2},{"id":"b_38","day":8,"seller":"Утилизация Плюс","contact":"","region":"Тюменская область","city":"Тюмень","views":4575,"link":"https://www.avito.ru/tyumen/predlozheniya_uslug/utilizatsiyavykup_elektronikielektronnyh_plat_4207976006","offerIdx":3},{"id":"b_39","day":8,"seller":"Илья","contact":"","region":"Москва","city":"Москва","views":4503,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/dokumenty_na_avto_yaponskie_armyanskie_rf_uchet_8181709288","offerIdx":4},{"id":"b_40","day":9,"seller":"Александр","contact":"","region":"Калининградская область","city":"Калининград","views":4286,"link":"https://www.avito.ru/kaliningrad/predlozheniya_uslug/tamozhennoe_oformlenie_sbkts_epts_util_sbor_era_663258764","offerIdx":0},{"id":"b_41","day":9,"seller":"Пользователь","contact":"","region":"Самарская область","city":"Самара","views":4224,"link":"https://www.avito.ru/samara/predlozheniya_uslug/arenda_mercedes_s-klass_w-223_7703078372","offerIdx":1},{"id":"b_42","day":9,"seller":"Пользователь","contact":"","region":"Дагестан","city":"Новый Хушет","views":4173,"link":"https://www.avito.ru/novyy_hushet/predlozheniya_uslug/oformlenie_epts_sbkts_utilsbor_7858646797","offerIdx":2},{"id":"b_43","day":9,"seller":"ЭЛЯ (drive_elfik)","contact":"","region":"Москва","city":"Зеленоград","views":4059,"link":"https://www.avito.ru/moskva_zelenograd/predlozheniya_uslug/lichnyy_personalnyy_semeynyy_4552718859","offerIdx":3},{"id":"b_44","day":9,"seller":"Роман","contact":"","region":"Ханты-Мансийский АО","city":"Нягань","views":4051,"link":"https://www.avito.ru/nyagan/predlozheniya_uslug/arenda_uslugi_zakaz_avtobusa_mikroavtobusa_535906881","offerIdx":4},{"id":"b_45","day":10,"seller":"Владимир","contact":"","region":"Москва","city":"Москва","views":4003,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/sbkts_epts_util_sbor_rastamozhka_3639301688","offerIdx":0},{"id":"b_46","day":10,"seller":"Пользователь","contact":"","region":"Тюменская область","city":"Тюмень","views":3971,"link":"https://www.avito.ru/tyumen/predlozheniya_uslug/arenda_avto_furgonkabluk_rabota_v_yandeks_gruzovoy_7726694091","offerIdx":1},{"id":"b_47","day":10,"seller":"Виталий Палки","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":3842,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/sbktsutilizatsionnyy_sboroformlenie_avto_v_tamozhn_2568728705","offerIdx":2},{"id":"b_48","day":10,"seller":"Даниил-Утиль Сервис","contact":"","region":"Тюменская область","city":"Тюмень","views":3533,"link":"https://www.avito.ru/tyumen/predlozheniya_uslug/skupka_elektroniki_7412516510","offerIdx":3},{"id":"b_49","day":10,"seller":"Александр","contact":"","region":"Московская область","city":"Королев","views":3494,"link":"https://www.avito.ru/korolev/predlozheniya_uslug/avtovoz_bishkek_almaty_shymkent_astana_moskva_2493512231","offerIdx":4},{"id":"b_50","day":11,"seller":"Elpts-Lab/ totauto","contact":"","region":"Москва","city":"Москва","views":3355,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_epts_sbkts_zoets_utilsbor_7524580651","offerIdx":0},{"id":"b_51","day":11,"seller":"Наталия","contact":"","region":"Воронежская область","city":"Воронеж","views":3218,"link":"https://www.avito.ru/voronezh/predlozheniya_uslug/avtokurer_na_nashem_avtomobile_7857969267","offerIdx":1},{"id":"b_52","day":11,"seller":"Юра Деточкин","contact":"","region":"Краснодарский край","city":"Сочи","views":3057,"link":"https://www.avito.ru/sochi/predlozheniya_uslug/postanovka_na_uchet_avtomobilya_registratsiya_v_gibdd_2384515120","offerIdx":2},{"id":"b_53","day":11,"seller":"Евгений RF AUTO","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":2959,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/oformlenie_sbkts_epts_util_pod_klyuch_2886716460","offerIdx":3},{"id":"b_54","day":11,"seller":"Владислав Cars Shop | ИМПОРТ АВТО","contact":"","region":"Самарская область","city":"Самара","views":2893,"link":"https://www.avito.ru/samara/predlozheniya_uslug/hyundai_elantra_pod_zakaz_7904773487","offerIdx":4},{"id":"b_55","day":12,"seller":"Александр","contact":"","region":"Москва","city":"Москва","views":2800,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/avtovykup_bitye_tselye_vykup_avto_posle_dtp_ne_na_h_2320094374","offerIdx":0},{"id":"b_56","day":12,"seller":"Владимир","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":2799,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/rastamozhka_epts_sbkts_util_sbor_3127123487","offerIdx":1},{"id":"b_57","day":12,"seller":"АвтоПомощь","contact":"","region":"Москва","city":"Москва","views":2771,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/postanovka_na_uchet_v_gibdd_avto_i_moto_7971275447","offerIdx":2},{"id":"b_58","day":12,"seller":"Premium Standart","contact":"Елена","region":"Москва","city":"Москва","views":2657,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_zoets_pod_klyuch_3988945238","offerIdx":3},{"id":"b_59","day":12,"seller":"Таможенный брокер Николай Ман.","contact":"Николай","region":"Санкт-Петербург","city":"Санкт-Петербург","views":2642,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_3362821726","offerIdx":4},{"id":"b_60","day":13,"seller":"Пользователь","contact":"Артур Максимович","region":"Самарская область","city":"Самара","views":2518,"link":"https://www.avito.ru/samara/predlozheniya_uslug/sbkts_i_epts_spisanie_util._sbora_7541517506","offerIdx":0},{"id":"b_61","day":13,"seller":"Сергей","contact":"","region":"Коми","city":"Сыктывкар","views":2422,"link":"https://www.avito.ru/syktyvkar/predlozheniya_uslug/zakaz_avtobusamikroavtobusapassazhirskie_perevozk_4095359535","offerIdx":1},{"id":"b_62","day":13,"seller":"Артём","contact":"","region":"Московская область","city":"Домодедово","views":2380,"link":"https://www.avito.ru/domodedovo/predlozheniya_uslug/tamozhennyy_broker_dlya_avtomobilya_4502513298","offerIdx":2},{"id":"b_63","day":13,"seller":"Пользователь","contact":"По Объявлению","region":"Новосибирская область","city":"Новосибирск","views":2342,"link":"https://www.avito.ru/novosibirsk/predlozheniya_uslug/oformlenie_epsm_kvadrotsikl_snegohoda_util_sbor_3664806024","offerIdx":3},{"id":"b_64","day":13,"seller":"Андрей Львович","contact":"","region":"Москва","city":"Москва","views":2282,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/sistematizatsiya_biznesa_933477229","offerIdx":4},{"id":"b_65","day":14,"seller":"Таможенный брокер Николай Ман.","contact":"Николай М","region":"Брянская область","city":"Брянск","views":2216,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_2723107975","offerIdx":0},{"id":"b_66","day":14,"seller":"Владимир","contact":"","region":"Тюменская область","city":"Тюмень","views":2154,"link":"https://www.avito.ru/tyumen/predlozheniya_uslug/zakaz_mikroavtobusa_2308899570","offerIdx":1},{"id":"b_67","day":14,"seller":"ЮРИЙ","contact":"","region":"Брянская область","city":"Брянск","views":2136,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/privezu_avto_iz_evropy_i_rb_eptssbkts_otchet_ot_4287302207","offerIdx":2},{"id":"b_68","day":14,"seller":"Дмитрий Сергеевич Разумов","contact":"","region":"Новосибирская область","city":"Новосибирск","views":2120,"link":"https://www.avito.ru/novosibirsk/predlozheniya_uslug/avtoinstruktor_mkpp_4749600165","offerIdx":3},{"id":"b_69","day":14,"seller":"Строительство домов и не только","contact":"","region":"Москва","city":"Москва","views":2111,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/vypiska_iz_epts_elektronnyy_pts_zamena_dublikata_2642349605","offerIdx":4},{"id":"b_70","day":15,"seller":"ДокАвто","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":2105,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/spisanie_util_sbora_bystro_epts_sbkts_2704835754","offerIdx":0},{"id":"b_71","day":15,"seller":"Help.","contact":"","region":"Калининградская область","city":"Калининград","views":2064,"link":"https://www.avito.ru/kaliningrad/predlozheniya_uslug/rastamozhka.sbkts_epts_util_2832309891","offerIdx":1},{"id":"b_72","day":15,"seller":"Пользователь","contact":"","region":"Московская область","city":"Люберцы","views":1955,"link":"https://www.avito.ru/lyubertsy/predlozheniya_uslug/tehosmotr_dlya_postanovki_na_uchet_v_lyubertsah_3645082771","offerIdx":2},{"id":"b_73","day":15,"seller":"Валерий","contact":"","region":"Калининградская область","city":"Калининград","views":1910,"link":"https://www.avito.ru/kaliningrad/predlozheniya_uslug/rastamozhka_dotamozhka_avto_sbkts_epts_utilsbor_3786644393","offerIdx":3},{"id":"b_74","day":15,"seller":"Услуги","contact":"","region":"Северная Осетия","city":"Владикавказ","views":1906,"link":"https://www.avito.ru/vladikavkaz/predlozheniya_uslug/tamozhennyy_broker_uin_obespechenie_4344551343","offerIdx":4},{"id":"b_75","day":16,"seller":"Смирнова Ирина- Агент на Торгах","contact":"Ирина","region":"Москва","city":"Москва","views":1827,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/agent_na_torgah_1891706363","offerIdx":0},{"id":"b_76","day":16,"seller":"Денис","contact":"","region":"Тюменская область","city":"Тобольск","views":1819,"link":"https://www.avito.ru/tobolsk/predlozheniya_uslug/turisticheskiy_avtobus_passazhirskie_perevozki_1608037623","offerIdx":1},{"id":"b_77","day":16,"seller":"Антон","contact":"","region":"Калужская область","city":"Обнинск","views":1756,"link":"https://www.avito.ru/obninsk/predlozheniya_uslug/avto_iz_evropy_korei_kitaya_sbkts_epts_3966233467","offerIdx":2},{"id":"b_78","day":16,"seller":"ЭПТС СБКТС УТИЛЬ","contact":"","region":"Воронежская область","city":"Воронеж","views":1713,"link":"https://www.avito.ru/voronezh/predlozheniya_uslug/oformlyu_epts_vnesu_sobstvennika_4282542251","offerIdx":3},{"id":"b_79","day":16,"seller":"Пользователь","contact":"","region":"Калининградская область","city":"Калининград","views":1697,"link":"https://www.avito.ru/kaliningrad/predlozheniya_uslug/rastamozhka_utilsbor_dostavka_7323914411","offerIdx":4},{"id":"b_80","day":17,"seller":"Артём","contact":"","region":"Москва","city":"Москва","views":1683,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_sbkts_epts_util_3333742469","offerIdx":0},{"id":"b_81","day":17,"seller":"///AMG","contact":"","region":"Северная Осетия","city":"Владикавказ","views":1609,"link":"https://www.avito.ru/vladikavkaz/predlozheniya_uslug/spisanie_util_sbora_poluchenie_epts-sbkts_7788684956","offerIdx":1},{"id":"b_82","day":17,"seller":"Таможенный брокер Николай Ман.","contact":"Николай М","region":"Северная Осетия","city":"Владикавказ","views":1565,"link":"https://www.avito.ru/vladikavkaz/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_3138944680","offerIdx":2},{"id":"b_83","day":17,"seller":"Таможенный брокер Николай Ман.","contact":"Николай М","region":"Московская область","city":"Одинцово","views":1548,"link":"https://www.avito.ru/odintsovo/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_3106897995","offerIdx":3},{"id":"b_84","day":17,"seller":"ВМ","contact":"","region":"Брянская область","city":"Брянск","views":1547,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/rastamozhit_avto_elektronnyy_pts_sbkts_2545990783","offerIdx":4},{"id":"b_85","day":18,"seller":"Алекс.","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":1546,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/sbktseptsoformlenie_util_sborapod_klyuch_3689503221","offerIdx":0},{"id":"b_86","day":18,"seller":"Anton Cars Shop","contact":"","region":"Самарская область","city":"Самара","views":1540,"link":"https://www.avito.ru/samara/predlozheniya_uslug/kia_seltos_15_2026_8112040008","offerIdx":1},{"id":"b_87","day":18,"seller":"Пользователь","contact":"Андрей","region":"Краснодарский край","city":"Краснодар","views":1509,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/tamozhnyasbkts_epts_util_2301992111","offerIdx":2},{"id":"b_88","day":18,"seller":"Пользователь","contact":"","region":"Свердловская область","city":"Березовский","views":1497,"link":"https://www.avito.ru/sverdlovskaya_oblast_berezovskiy/predlozheniya_uslug/izgotovlenie_kart_dlya_tahografov_skzi_estr_rf_2211127978","offerIdx":3},{"id":"b_89","day":18,"seller":"Денис.","contact":"","region":"Москва","city":"Москва","views":1364,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/utilizatsiya_avto_2173273175","offerIdx":4},{"id":"b_90","day":19,"seller":"Оформление Авто","contact":"","region":"Новосибирская область","city":"Новосибирск","views":1342,"link":"https://www.avito.ru/novosibirsk/predlozheniya_uslug/oformlenie_epts_sbkts_2760483854","offerIdx":0},{"id":"b_91","day":19,"seller":"Пользователь","contact":"","region":"Марий Эл","city":"Йошкар-Ола","views":1285,"link":"https://www.avito.ru/yoshkar-ola/predlozheniya_uslug/sbkts_epts_tpo_pomosch_v_poluchenii_7656449097","offerIdx":1},{"id":"b_92","day":19,"seller":"Частное лицо","contact":"","region":"Московская область","city":"Домодедово","views":1258,"link":"https://www.avito.ru/domodedovo/predlozheniya_uslug/tamozhennyy_broker_rasstamozhka_epts_sbkts_otsenka_4665003887","offerIdx":2},{"id":"b_93","day":19,"seller":"Таможенный брокер Николай Ман.","contact":"Николай М","region":"Ставропольский край","city":"Ставрополь","views":1231,"link":"https://www.avito.ru/stavropol/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_3459486664","offerIdx":3},{"id":"b_94","day":19,"seller":"Анна","contact":"","region":"Москва","city":"Москва","views":1206,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_epts_sbkts_utilizatsionnyy_sbor_tpo_2554215168","offerIdx":4},{"id":"b_95","day":20,"seller":"ЕС","contact":"","region":"Новосибирская область","city":"Новосибирск","views":1202,"link":"https://www.avito.ru/novosibirsk/predlozheniya_uslug/tamozhennoe_oformlenie_broker_deklarant_4381782607","offerIdx":0},{"id":"b_96","day":20,"seller":"Help.","contact":"","region":"Смоленская область","city":"Смоленск","views":1195,"link":"https://www.avito.ru/smolensk/predlozheniya_uslug/sbkts_epts_psmutilsbor_rastamozhka_3759987306","offerIdx":1},{"id":"b_97","day":20,"seller":"Оформление Авто","contact":"","region":"Краснодарский край","city":"Краснодар","views":1183,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/oformlenie_epts_sbkts_4424221774","offerIdx":2},{"id":"b_98","day":20,"seller":"Пользователь","contact":"меня зовут Александр","region":"Нижегородская область","city":"Нижний Новгород","views":1138,"link":"https://www.avito.ru/nizhniy_novgorod/predlozheniya_uslug/tamozhennoe_oformlenie_avto_epts_sbkts_util_2487410432","offerIdx":3},{"id":"b_99","day":20,"seller":"ООО RUSAUTOIMPORT (Дмитрий)","contact":"","region":"Челябинская область","city":"Челябинск","views":1136,"link":"https://www.avito.ru/chelyabinsk/predlozheniya_uslug/oformlenie_util_sbora_epts_sbkts_epsm_raritet_4548424562","offerIdx":4},{"id":"b_100","day":21,"seller":"Ирина","contact":"Ирина","region":"Саратовская область","city":"Саратов","views":1128,"link":"https://www.avito.ru/saratov/predlozheniya_uslug/epts_sbkts_epsm_util_pereselentsy_2838113742","offerIdx":0},{"id":"b_101","day":21,"seller":"Александр .","contact":"","region":"Московская область","city":"Химки","views":1075,"link":"https://www.avito.ru/himki/predlozheniya_uslug/tamozhennyy_broker.usakitay.epts_util_4150949587","offerIdx":1},{"id":"b_102","day":21,"seller":"ООО RUSAUTOIMPORT (Дмитрий)","contact":"","region":"Московская область","city":"Одинцово","views":1051,"link":"https://www.avito.ru/odintsovo/predlozheniya_uslug/oformlenie_sbkts_epts_epsm_util_sbor_rastamozhka_4740029638","offerIdx":2},{"id":"b_103","day":21,"seller":"Центр Обслуживания Клиентов","contact":"Николай","region":"Костромская область","city":"Шарья","views":1027,"link":"https://www.avito.ru/sharya/predlozheniya_uslug/pereoborudovanie_ts._registratsiya_izmeneniy_2508986231","offerIdx":3},{"id":"b_104","day":21,"seller":"Оформление Авто","contact":"","region":"Краснодарский край","city":"Славянск-на-Кубани","views":999,"link":"https://www.avito.ru/slavyansk-na-kubani/predlozheniya_uslug/oformlenie_sbkts_epts_2920691326","offerIdx":4},{"id":"b_105","day":22,"seller":"Пользователь","contact":"","region":"Вологодская область","city":"Вологда","views":983,"link":"https://www.avito.ru/vologda/predlozheniya_uslug/avtobus_v_arendu_dlya_perevozki_passazhirov_4233279913","offerIdx":0},{"id":"b_106","day":22,"seller":"АвтоПомощь","contact":"","region":"Московская область","city":"Мытищи","views":969,"link":"https://www.avito.ru/mytischi/predlozheniya_uslug/pomosch_v_gai_gibdd_mreo_8099721513","offerIdx":1},{"id":"b_107","day":22,"seller":"Пользователь","contact":"","region":"Северная Осетия","city":"Владикавказ","views":968,"link":"https://www.avito.ru/vladikavkaz/predlozheniya_uslug/tamozhennyy_broker_4143102212","offerIdx":2},{"id":"b_108","day":22,"seller":"AND","contact":"AND","region":"Москва","city":"Москва","views":963,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/sbkts_glonass_epts_util_-_pomosch_v_oformlenii_3270345427","offerIdx":3},{"id":"b_109","day":22,"seller":"ИП Поддубный НВ","contact":"Николай","region":"Брянская область","city":"Брянск","views":939,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/oformlenie_epts_sbkts_util_pod_klyuch_3828131926","offerIdx":4},{"id":"b_110","day":23,"seller":"Пользователь","contact":"","region":"Ростовская область","city":"Ростов-на-Дону","views":917,"link":"https://www.avito.ru/rostov-na-donu/predlozheniya_uslug/oformlenie_sbkts_epts_epsm_utilsbor_rastamozhka_4534005365","offerIdx":0},{"id":"b_111","day":23,"seller":"Пользователь","contact":"","region":"Татарстан","city":"Набережные Челны","views":900,"link":"https://www.avito.ru/naberezhnye_chelny/predlozheniya_uslug/mashiny_rastamozhka_2684005103","offerIdx":1},{"id":"b_112","day":23,"seller":"Михаил","contact":"","region":"Самарская область","city":"Самара","views":894,"link":"https://www.avito.ru/samara/predlozheniya_uslug/hyundai_elantra_2026_8103221139","offerIdx":2},{"id":"b_113","day":23,"seller":"Дмитрий","contact":"","region":"Ростовская область","city":"Ростов-на-Дону","views":872,"link":"https://www.avito.ru/rostov-na-donu/predlozheniya_uslug/avtomobili_v_nalichiivykup_7778818865","offerIdx":3},{"id":"b_114","day":23,"seller":"Андрей Дудкин","contact":"","region":"Москва","city":"Зеленоград","views":854,"link":"https://www.avito.ru/moskva_zelenograd/predlozheniya_uslug/spishem_i_oplatim_utilizatsionnyy_sbor_3180559445","offerIdx":4},{"id":"b_115","day":24,"seller":"Таможенный брокер Николай Ман.","contact":"Николай М","region":"Самарская область","city":"Новокуйбышевск","views":831,"link":"https://www.avito.ru/novokuybyshevsk/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_3618815452","offerIdx":0},{"id":"b_116","day":24,"seller":"Пользователь","contact":"Анна","region":"Москва","city":"Зеленоград","views":831,"link":"https://www.avito.ru/moskva_zelenograd/predlozheniya_uslug/oformlenie_sbkts_epts_rastamozhka_4445079098","offerIdx":1},{"id":"b_117","day":24,"seller":"Андрей","contact":"Менеджер","region":"Московская область","city":"Люберцы","views":783,"link":"https://www.avito.ru/lyubertsy/predlozheniya_uslug/vykup_avto_na_avtorazbor_metallolom_7487895572","offerIdx":2},{"id":"b_118","day":24,"seller":"Антон","contact":"","region":"Москва","city":"Москва","views":774,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/postanovka_na_uchet_avto_moto._sohranenie_nomerov_8169226491","offerIdx":3},{"id":"b_119","day":24,"seller":"Таможенный брокер Николай Ман.","contact":"Николай М","region":"Московская область","city":"Балашиха","views":766,"link":"https://www.avito.ru/balashiha/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_3971230329","offerIdx":4},{"id":"b_120","day":25,"seller":"ЭПТС СБКТС УТИЛЬ","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":757,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/smena_sobstvennika_epts_oformlenie_3802945438","offerIdx":0},{"id":"b_121","day":25,"seller":"Пользователь","contact":"","region":"Калужская область","city":"Обнинск","views":745,"link":"https://www.avito.ru/obninsk/predlozheniya_uslug/sbkts_epts_utilsbor_2497223845","offerIdx":1},{"id":"b_122","day":25,"seller":"Пользователь","contact":"","region":"Пермский край","city":"Пермь","views":738,"link":"https://www.avito.ru/perm/predlozheniya_uslug/tamozhennoe_oformlenie._statisticheskie_formy_eaes_1369166237","offerIdx":2},{"id":"b_123","day":25,"seller":"Валерий.","contact":"Валерий","region":"Москва","city":"Москва","views":716,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_tamozhnya_sbkts_eptsulil_2719451313","offerIdx":3},{"id":"b_124","day":25,"seller":"АкадемТест - Испытательная  лаборатория 🏎️","contact":"","region":"Краснодарский край","city":"Краснодар","views":714,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/oformlenie_sbkts_i_epts_3498775465","offerIdx":4},{"id":"b_125","day":26,"seller":"Яна Тарасова","contact":"","region":"Другой","city":"punta-arenas","views":705,"link":"https://www.avito.ru/punta-arenas/predlozheniya_uslug/sbkts_epts_knopka_glonass_zoets_nami_2448054264","offerIdx":0},{"id":"b_126","day":26,"seller":"Пользователь","contact":"","region":"Удмуртия","city":"Ижевск","views":702,"link":"https://www.avito.ru/izhevsk/predlozheniya_uslug/arenda_mikroavtobusov_s_voditelem_7247783807","offerIdx":1},{"id":"b_127","day":26,"seller":"Максим Олегович","contact":"","region":"Москва","city":"Москва","views":691,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/rastamozhka_avtooformlenie_sbkts_i_eptsutil_sbor_7471198913","offerIdx":2},{"id":"b_128","day":26,"seller":"Алина","contact":"","region":"Москва","city":"Москва","views":687,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/okleyka_gost_taksi_belyy_zheltyy_tsvet_7965376304","offerIdx":3},{"id":"b_129","day":26,"seller":"Автоэксперт","contact":"Артем","region":"Москва","city":"Москва","views":666,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/spisanie_utilsbora_za_1_den_util_sbor_7528877947","offerIdx":4},{"id":"b_130","day":27,"seller":"RASL IMPEX","contact":"","region":"Татарстан","city":"Набережные Челны","views":642,"link":"https://www.avito.ru/naberezhnye_chelny/predlozheniya_uslug/konsultatsiya_eksportimport_tovarov_3690559653","offerIdx":0},{"id":"b_131","day":27,"seller":"Дмитрий","contact":"","region":"Брянская область","city":"Брянск","views":637,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/zakaz_avtomobiley_2443458745","offerIdx":1},{"id":"b_132","day":27,"seller":"Вадим Невзоров","contact":"","region":"Москва","city":"Москва","views":626,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_elektronnogo_pts_sbkts_2387276550","offerIdx":2},{"id":"b_133","day":27,"seller":"Пользователь","contact":"","region":"Вологодская область","city":"Череповец","views":609,"link":"https://www.avito.ru/cherepovets/predlozheniya_uslug/vyvoz_bu_shin_podacha_20_min_8068103775","offerIdx":3},{"id":"b_134","day":27,"seller":"ГалереяАвто56 / Авто из-за границы","contact":"","region":"Самарская область","city":"Самара","views":606,"link":"https://www.avito.ru/samara/predlozheniya_uslug/novyy_avtomobil_mazda_cx-5_2026_8132289469","offerIdx":4},{"id":"b_135","day":28,"seller":"Пользователь","contact":"","region":"Ярославская область","city":"Ярославль","views":596,"link":"https://www.avito.ru/yaroslavl/predlozheniya_uslug/pereoborudovanie_ts.epts_sbks_util_sbor_3496760229","offerIdx":0},{"id":"b_136","day":28,"seller":"Спецтехника РегионАвто","contact":"Артур","region":"Томская область","city":"Томск","views":581,"link":"https://www.avito.ru/tomsk/predlozheniya_uslug/mini-ekskavator_komatsu_pc38uu-6_8217675813","offerIdx":1},{"id":"b_137","day":28,"seller":"Евгений RF AUTO","contact":"Евгений","region":"Москва","city":"Москва","views":573,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/sbkts_epts_utilsbor_-_oformlenie_za_1_sutki_8101291852","offerIdx":2},{"id":"b_138","day":28,"seller":"Василий","contact":"","region":"Брянская область","city":"Брянск","views":573,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/sbkts_elektronnyy_pts_util_2525461262","offerIdx":3},{"id":"b_139","day":28,"seller":"АВТО-Партнер","contact":"","region":"Ростовская область","city":"Ростов-на-Дону","views":571,"link":"https://www.avito.ru/rostov-na-donu/predlozheniya_uslug/utiloformlenie_epts_sbkts_2683837916","offerIdx":4},{"id":"b_140","day":29,"seller":"Пользователь","contact":"Николай Сергеевич","region":"Краснодарский край","city":"Сочи","views":549,"link":"https://www.avito.ru/sochi/predlozheniya_uslug/sertifikatsiya_deklaratsiya_dlya_marketpleysov_2023850835","offerIdx":0},{"id":"b_141","day":29,"seller":"Наталья","contact":"","region":"Москва","city":"Москва","views":546,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_epts_sbkts_spisanie_utilsbora_4213937633","offerIdx":1},{"id":"b_142","day":29,"seller":"Услуги","contact":"","region":"Ставропольский край","city":"Ставрополь","views":536,"link":"https://www.avito.ru/stavropol/predlozheniya_uslug/rastamozhka_tamozhennyy_brokeruin_7256053955","offerIdx":2},{"id":"b_143","day":29,"seller":"Антон","contact":"","region":"Самарская область","city":"Самара","views":494,"link":"https://www.avito.ru/samara/predlozheniya_uslug/epts_sbkts_spisanie_utilya_rastamozhka_pod_klyuch_4229531322","offerIdx":3},{"id":"b_144","day":29,"seller":"Смирнова Ирина- Агент на Торгах","contact":"Ирина","region":"Иркутская область","city":"Братск","views":467,"link":"https://www.avito.ru/bratsk/predlozheniya_uslug/agent_na_torgah_v_bratske_7938322656","offerIdx":4},{"id":"b_145","day":30,"seller":"VED-Online","contact":"","region":"Краснодарский край","city":"Новороссийск","views":462,"link":"https://www.avito.ru/novorossiysk/predlozheniya_uslug/tamozhennoe_oformlenie_ved_pod_klyuch_7487446190","offerIdx":0},{"id":"b_146","day":30,"seller":"Алексей","contact":"","region":"Смоленская область","city":"Смоленск","views":432,"link":"https://www.avito.ru/smolensk/predlozheniya_uslug/tamozhennoe_oformlenie_ved_broker_deklarant_2374358180","offerIdx":1},{"id":"b_147","day":30,"seller":"Пользователь","contact":"Анна","region":"Самарская область","city":"Самара","views":417,"link":"https://www.avito.ru/samara/predlozheniya_uslug/oformlenie_sbkts_epts_ot_laboratorii_meridian_7580528337","offerIdx":2},{"id":"b_148","day":30,"seller":"Пользователь","contact":"","region":"Ростовская область","city":"Каменск-Шахтинский","views":382,"link":"https://www.avito.ru/kamensk-shahtinskiy/predlozheniya_uslug/avtomobili_s_auktsionov_yaponii_3982456426","offerIdx":3},{"id":"b_149","day":30,"seller":"Пользователь","contact":"","region":"Санкт-Петербург","city":"Пушкин","views":372,"link":"https://www.avito.ru/sankt-peterburg_pushkin/predlozheniya_uslug/stsepka_dongfeng_gx_tyagach_stsepka_pod_0_vznosa_8008766456","offerIdx":4},{"id":"b_150","day":31,"seller":"ИП Новоковский Егор Станиславович","contact":"Егор Станиславович","region":"Омская область","city":"Омск","views":362,"link":"https://www.avito.ru/omsk/predlozheniya_uslug/tamozhennyy_broker_dlya_avtomobilya_7291771237","offerIdx":0},{"id":"b_151","day":31,"seller":"Ип Гордеев И. И","contact":"Илья","region":"Краснодарский край","city":"Краснодар","views":359,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/mashiny_iz_gruzii_pod_klyuchrastamozhka_avto_pod_klyu_7329852671","offerIdx":1},{"id":"b_152","day":31,"seller":"Saul Auto Import","contact":"","region":"Северная Осетия","city":"Владикавказ","views":350,"link":"https://www.avito.ru/vladikavkaz/predlozheniya_uslug/oformlenie_retro_avto_raritet_8149647984","offerIdx":2},{"id":"b_153","day":31,"seller":"Пользователь","contact":"","region":"Ставропольский край","city":"Ставрополь","views":339,"link":"https://www.avito.ru/stavropol/predlozheniya_uslug/zakaz_avtobusov_7791996310","offerIdx":3},{"id":"b_154","day":31,"seller":"Александр Сергеевич","contact":"Александр Сергеевич","region":"Белгородская область","city":"Белгород","views":338,"link":"https://www.avito.ru/belgorod/predlozheniya_uslug/oformlenie_epts_sbkts_utilsbor_v_belgorode_7658854753","offerIdx":4},{"id":"b_155","day":32,"seller":"АВТОЛОКАЦИЯ, Омск","contact":"","region":"Омская область","city":"Омск","views":330,"link":"https://www.avito.ru/omsk/predlozheniya_uslug/avtomobili_s_yaponii_korei_kitaya_evropy_oae_3447649065","offerIdx":0},{"id":"b_156","day":32,"seller":"Пользователь","contact":"","region":"Калужская область","city":"Калуга","views":328,"link":"https://www.avito.ru/kaluga/predlozheniya_uslug/sbkts_epts_utilsbor_3617330203","offerIdx":1},{"id":"b_157","day":32,"seller":"Импорт Авто под заказ из Китая и Кореи","contact":"Сергей","region":"Татарстан","city":"Казань","views":324,"link":"https://www.avito.ru/kazan/predlozheniya_uslug/volkswagen_tayron_2022_goda_150_l.s_7904653348","offerIdx":2},{"id":"b_158","day":32,"seller":"Сергей","contact":"","region":"Московская область","city":"Балашиха","views":317,"link":"https://www.avito.ru/balashiha/predlozheniya_uslug/utilsbor_epts_sbkts_epsm_zoets_import_70_armeniya_4322232569","offerIdx":3},{"id":"b_159","day":32,"seller":"Смирнова Ирина- Агент на Торгах","contact":"Ирина","region":"Пермский край","city":"Пермь","views":304,"link":"https://www.avito.ru/perm/predlozheniya_uslug/agent_na_torgah_v_permi_8002610971","offerIdx":4},{"id":"b_160","day":33,"seller":"Честность , залог здоровья","contact":"Игорь","region":"Ивановская область","city":"Иваново","views":295,"link":"https://www.avito.ru/ivanovo/predlozheniya_uslug/oformlenie_sbkts_-epts_-util_sbor_3949139974","offerIdx":0},{"id":"b_161","day":33,"seller":"Lars Motors","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":295,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/rastamozhka_avto_iz_gruziiobespecheniebroker_4274085591","offerIdx":1},{"id":"b_162","day":33,"seller":"Растаможка Самара/Списание утиля","contact":"Элина","region":"Самарская область","city":"Самара","views":290,"link":"https://www.avito.ru/samara/predlozheniya_uslug/rastamozhka_avto_samara_litsenziya_fts_8066596466","offerIdx":2},{"id":"b_163","day":33,"seller":"РС Лоджистикс - ВЭД, таможня, логистика","contact":"Артем","region":"Нижегородская область","city":"Нижний Новгород","views":283,"link":"https://www.avito.ru/nizhniy_novgorod/predlozheniya_uslug/rastamozhka_avtotehniki_spisanie_utilsbora_epts_7632876551","offerIdx":3},{"id":"b_164","day":33,"seller":"ATV ZIP","contact":"","region":"Татарстан","city":"Чистополь","views":278,"link":"https://www.avito.ru/chistopol/predlozheniya_uslug/oformlenie_epsm_pod_klyuch_util_sbor_3802148824","offerIdx":4},{"id":"b_165","day":34,"seller":"ЦРСИ Официальный Центр Регистрации Спортивного Инвентаря","contact":"","region":"Крым","city":"Симферополь","views":272,"link":"https://www.avito.ru/simferopol/predlozheniya_uslug/oformit_sportinventar_samodelnaya_tehnika_7985097378","offerIdx":0},{"id":"b_166","day":34,"seller":"CarrBuy- доставка и растаможка авто-мототехники","contact":"Андрей","region":"Беларусь","city":"Минск","views":258,"link":"https://www.avito.ru/minsk/predlozheniya_uslug/rastamozhka_avto_moto_cherez_belarus_po_lgote_50_7807366908","offerIdx":1},{"id":"b_167","day":34,"seller":"ЮРИСТ. ЮРИДИЧЕСКИЕ УСЛУГИ","contact":"","region":"Москва","city":"Москва","views":255,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/tamozhennyy_yurist._ved_kontrakty._sud._utilsbor_7360017248","offerIdx":2},{"id":"b_168","day":34,"seller":"ЦРСИ Официальный Центр Регистрации Спортивного Инвентаря","contact":"Менеджер","region":"Удмуртия","city":"Ижевск","views":253,"link":"https://www.avito.ru/izhevsk/predlozheniya_uslug/sportinventar_ofitsialno_oformit_v_baze_enduro_8049604564","offerIdx":3},{"id":"b_169","day":34,"seller":"Мария Гузненкова","contact":"","region":"Москва","city":"Москва","views":250,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_sbkts_i_epts_7883065103","offerIdx":4},{"id":"b_170","day":35,"seller":"Игорь","contact":"","region":"Москва","city":"Москва","views":243,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/util_epts_sbkts_zoets_tamozhennoe_oformlenie_3580609313","offerIdx":0},{"id":"b_171","day":35,"seller":"ATV ZIP","contact":"","region":"Белгородская область","city":"Белгород","views":240,"link":"https://www.avito.ru/belgorod/predlozheniya_uslug/oformlenie_epsm_pod_klyuch_util_sbor_4346294438","offerIdx":1},{"id":"b_172","day":35,"seller":"Пользователь","contact":"","region":"Ханты-Мансийский АО","city":"Мегион","views":228,"link":"https://www.avito.ru/megion/predlozheniya_uslug/izgotovlenie_gos_nomerov_lyubyh_tipov_7914927319","offerIdx":2},{"id":"b_173","day":35,"seller":"АЛЕКСЕЙ","contact":"","region":"Ростовская область","city":"Ростов-на-Дону","views":227,"link":"https://www.avito.ru/rostov-na-donu/predlozheniya_uslug/epts_sbkts_util_sbor_rastamozhka_2526537881","offerIdx":3},{"id":"b_174","day":35,"seller":"Александр","contact":"","region":"Ставропольский край","city":"Ставрополь","views":220,"link":"https://www.avito.ru/stavropol/predlozheniya_uslug/hyundai_elantra_8064735199","offerIdx":4},{"id":"b_175","day":36,"seller":"\"ЦРСИ\" Регистрация спортивного инвентаря","contact":"","region":"Пермский край","city":"Пермь","views":210,"link":"https://www.avito.ru/perm/predlozheniya_uslug/oformlenie_sportinventarya_legalno_v_baze_8075104492","offerIdx":0},{"id":"b_176","day":36,"seller":"Пользователь","contact":"","region":"Московская область","city":"Одинцово","views":205,"link":"https://www.avito.ru/odintsovo/predlozheniya_uslug/oformlenie_sbkts_epts_zaklyucheniya_nami_i_drugoe_3078277138","offerIdx":1},{"id":"b_177","day":36,"seller":"Александр","contact":"","region":"Московская область","city":"Серпухов","views":193,"link":"https://www.avito.ru/serpuhov/predlozheniya_uslug/avtovykup_bitye_tselye_vykup_avto_posle_dtp_ne_na_h_4079926758","offerIdx":2},{"id":"b_178","day":36,"seller":"Артем","contact":"","region":"Москва","city":"Москва","views":190,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/posrednik_v_kitae_3313610618","offerIdx":3},{"id":"b_179","day":36,"seller":"Таможенный брокер г.Пермь","contact":"","region":"Пермский край","city":"Пермь","views":182,"link":"https://www.avito.ru/perm/predlozheniya_uslug/rastamozhka_avto_tamozhnya_laboratoriya_nomera_8151876501","offerIdx":4},{"id":"b_180","day":37,"seller":"Анастасия","contact":"","region":"Калининградская область","city":"Калининград","views":181,"link":"https://www.avito.ru/kaliningrad/predlozheniya_uslug/bankovskaya_karta_kirgizii_visa_7991279793","offerIdx":0},{"id":"b_181","day":37,"seller":"Испытательная лаборатория \"ПТО СТАРТ\"","contact":"Александр","region":"Ставропольский край","city":"Зеленокумск","views":180,"link":"https://www.avito.ru/zelenokumsk/predlozheniya_uslug/oformlenie_epts_sbkts_4555442283","offerIdx":1},{"id":"b_182","day":37,"seller":"Растаможь РФ","contact":"","region":"Москва","city":"Москва","views":178,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/spisanie_utilizatsionnogo_sbora_utilsbor_8054574279","offerIdx":2},{"id":"b_183","day":37,"seller":"Гульнара","contact":"","region":"Татарстан","city":"Набережные Челны","views":175,"link":"https://www.avito.ru/naberezhnye_chelny/predlozheniya_uslug/laboratoriya_v_chelnah_oformlenie_sbkts_epts_util_4377309913","offerIdx":3},{"id":"b_184","day":37,"seller":"Таможенный брокер Николай Ман.","contact":"Николай","region":"Московская область","city":"Новосиньково","views":174,"link":"https://www.avito.ru/novosinkovo/predlozheniya_uslug/sbkts_epts_util-sbor_rastamozhka_i_prigon_avto_4194902389","offerIdx":4},{"id":"b_185","day":38,"seller":"Оформление Авто","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":168,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/oormlenie_avto_starshe_30_let_bez_utilsbora_8039639002","offerIdx":0},{"id":"b_186","day":38,"seller":"Смирнова Ирина- Агент на Торгах","contact":"Ирина","region":"Иркутская область","city":"Иркутск","views":158,"link":"https://www.avito.ru/irkutsk/predlozheniya_uslug/agent_na_torgah_v_irkutske_7746620289","offerIdx":1},{"id":"b_187","day":38,"seller":"ЦРСИ Russia","contact":"","region":"Крым","city":"Севастополь","views":158,"link":"https://www.avito.ru/sevastopol/predlozheniya_uslug/sportinventar_zaregistrirovat_v_baze_legalno_8016901855","offerIdx":2},{"id":"b_188","day":38,"seller":"ДРАКОН-АВТО!","contact":"","region":"Иркутская область","city":"Белореченский","views":153,"link":"https://www.avito.ru/belorechenskiy/predlozheniya_uslug/avto_pod_klyuch_7415650983","offerIdx":3},{"id":"b_189","day":38,"seller":"Пользователь","contact":"","region":"Ханты-Мансийский АО","city":"Когалым","views":150,"link":"https://www.avito.ru/kogalym/predlozheniya_uslug/pod_zakaz_avto_i_mototsikly_iz_yu.korei_3510132802","offerIdx":4},{"id":"b_190","day":39,"seller":"Saul Auto Import","contact":"","region":"Москва","city":"Москва","views":148,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_retro_avto_raritet_ekspertiza_8085015297","offerIdx":0},{"id":"b_191","day":39,"seller":"Батыр","contact":"","region":"Оренбургская область","city":"Оренбург","views":145,"link":"https://www.avito.ru/orenburg/predlozheniya_uslug/oformlenie_epts_sbkts_utilsbor_7672997613","offerIdx":1},{"id":"b_192","day":39,"seller":"ЦРСИ Спортинвентарь для техники","contact":"","region":"Краснодарский край","city":"Краснодар","views":139,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/sportinventar_oformit_legalno_8112154159","offerIdx":2},{"id":"b_193","day":39,"seller":"Пользователь","contact":"","region":"Челябинская область","city":"Миасс","views":139,"link":"https://www.avito.ru/miass/predlozheniya_uslug/sborka_elektroschitovogo_oborudovaniya_7340668851","offerIdx":3},{"id":"b_194","day":39,"seller":"Александр","contact":"","region":"Московская область","city":"Чехов","views":135,"link":"https://www.avito.ru/moskovskaya_oblast_chehov/predlozheniya_uslug/sbkts_epts_utilsbror_i_drugoe_3484278198","offerIdx":4},{"id":"b_195","day":40,"seller":"ООО «Технико-Диагностическая Лаборатория»","contact":"","region":"Ханты-Мансийский АО","city":"Нижневартовск","views":134,"link":"https://www.avito.ru/nizhnevartovsk/predlozheniya_uslug/nanesenie_vin_nomera_na_avtomobil_4653506387","offerIdx":0},{"id":"b_196","day":40,"seller":"Спецтехника от собственника","contact":"","region":"Свердловская область","city":"Екатеринбург","views":131,"link":"https://www.avito.ru/ekaterinburg/predlozheniya_uslug/arenda_i_uslugi_manipulyatora_strela_5_t_10.1_m_bort_7_t_6.6_m_8116208137","offerIdx":1},{"id":"b_197","day":40,"seller":"ВИКТОРИЯ","contact":"","region":"Калининградская область","city":"Калининград","views":126,"link":"https://www.avito.ru/kaliningrad/predlozheniya_uslug/tamozhennoe_oformlenie_avtomobiley_7940812843","offerIdx":2},{"id":"b_198","day":40,"seller":"Галина Расчектаева","contact":"","region":"Ханты-Мансийский АО","city":"Советский","views":125,"link":"https://www.avito.ru/hanty_mansiyskiy_ao_sovetskiy/predlozheniya_uslug/karty_voditelya_tahografy_3692849269","offerIdx":3},{"id":"b_199","day":40,"seller":"ATV ZIP","contact":"","region":"Воронежская область","city":"Воронеж","views":123,"link":"https://www.avito.ru/voronezh/predlozheniya_uslug/epsm_elektronnyy_pasport_samohodnoy_mashiny_8121826947","offerIdx":4},{"id":"b_200","day":41,"seller":"Lars Motors","contact":"","region":"Дагестан","city":"Махачкала","views":113,"link":"https://www.avito.ru/mahachkala/predlozheniya_uslug/rastamozhka_avto_iz_gruziiobespecheniebroker_5010177254","offerIdx":0},{"id":"b_201","day":41,"seller":"Пользователь","contact":"","region":"Ставропольский край","city":"Зеленокумск","views":111,"link":"https://www.avito.ru/zelenokumsk/predlozheniya_uslug/sbkts_epts_v_den_obrascheniya_7232381136","offerIdx":1},{"id":"b_202","day":41,"seller":"SBKTS_russia_Roman","contact":"","region":"Москва","city":"Москва","views":94,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_epts_sbkts_epsm._utilizatsionnyy_sbor_3749470369","offerIdx":2},{"id":"b_203","day":41,"seller":"Пользователь","contact":"","region":"Оренбургская область","city":"Оренбург","views":79,"link":"https://www.avito.ru/orenburg/predlozheniya_uslug/dostavka_mazda_cx_5_2026pod_zakaz_8072091303","offerIdx":3},{"id":"b_204","day":41,"seller":"Иван","contact":"","region":"Свердловская область","city":"Екатеринбург","views":78,"link":"https://www.avito.ru/ekaterinburg/predlozheniya_uslug/postanovka_na_uchet_v_gibdd_gostehnadzore_8201213077","offerIdx":4},{"id":"b_205","day":42,"seller":"ATV ZIP","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":66,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/epsm_elektronnyy_pasport_samohodnoy_mashiny_8185624301","offerIdx":0},{"id":"b_206","day":42,"seller":"Пользователь","contact":"","region":"Московская область","city":"Химки","views":66,"link":"https://www.avito.ru/himki/predlozheniya_uslug/utilizatsiya_avto_8037300991","offerIdx":1},{"id":"b_207","day":42,"seller":"Расул","contact":"","region":"Дагестан","city":"Новый Чиркей","views":66,"link":"https://www.avito.ru/novyy_chirkey/predlozheniya_uslug/prodazha_avto_ot_sobstvennika_8018810071","offerIdx":2},{"id":"b_208","day":42,"seller":"Оформление Авто","contact":"","region":"Москва","city":"Москва","views":65,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_sbkts_epts_7975089002","offerIdx":3},{"id":"b_209","day":42,"seller":"Услуги","contact":"","region":"Ставропольский край","city":"Минеральные Воды","views":65,"link":"https://www.avito.ru/mineralnye_vody/predlozheniya_uslug/epts_sbkts_laboratoriya_pts_8120604137","offerIdx":4},{"id":"b_210","day":43,"seller":"Нина","contact":"","region":"Москва","city":"Москва","views":60,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/oformlenie_sbkts_i_epts_bez_posrednikov_8094565199","offerIdx":0},{"id":"b_211","day":43,"seller":"Вадим","contact":"","region":"Москва","city":"Москва","views":55,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/sbkts_epts_utilsbor_tamozhennoe_oformlenie_7642474358","offerIdx":1},{"id":"b_212","day":43,"seller":"AVTOBROKER 12","contact":"","region":"Марий Эл","city":"Йошкар-Ола","views":44,"link":"https://www.avito.ru/yoshkar-ola/predlozheniya_uslug/avtomobili_na_zakaz_kitay_koreya_evropa_8211692043","offerIdx":2},{"id":"b_213","day":43,"seller":"Вячеслав","contact":"","region":"Краснодарский край","city":"Краснодар","views":40,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/zakaz_avtobusa_detskie_perevozki_po_zakazu_8073772756","offerIdx":3},{"id":"b_214","day":43,"seller":"ПЕКИН АВТО","contact":"Менеджер","region":"Кемеровская область","city":"Кемерово","views":39,"link":"https://www.avito.ru/kemerovo/predlozheniya_uslug/rastomozhka_avtospisanie_utilizatsionnogo_sbora_7730553631","offerIdx":4},{"id":"b_215","day":44,"seller":"Владимир","contact":"Владимир","region":"Краснодарский край","city":"Краснодар","views":39,"link":"https://www.avito.ru/krasnodar/predlozheniya_uslug/sbkts_epts_rastamozhka_utilsbor_util_tamozhnya_4719564023","offerIdx":0},{"id":"b_216","day":44,"seller":"Максим","contact":"","region":"Московская область","city":"Одинцово","views":38,"link":"https://www.avito.ru/odintsovo/predlozheniya_uslug/epts_sbkts_rastamozhka_utilsbor_pod_klyuch_8142641260","offerIdx":1},{"id":"b_217","day":44,"seller":"Егор | СБКТС ЭПТС Утиль Под Ключ","contact":"","region":"Москва","city":"Москва","views":37,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/paket_import_sbktseptsutil_8007042683","offerIdx":2},{"id":"b_218","day":44,"seller":"Александр","contact":"","region":"Московская область","city":"Волоколамск","views":36,"link":"https://www.avito.ru/volokolamsk/predlozheniya_uslug/avtovykup_bitye_tselye_vykup_avto_posle_dtp_ne_na_h_7823397562","offerIdx":3},{"id":"b_219","day":44,"seller":"Владислав","contact":"","region":"Башкортостан","city":"Уфа","views":32,"link":"https://www.avito.ru/ufa/predlozheniya_uslug/agent_na_torgah_po_bankrotstvu_obuchenie_8077970181","offerIdx":4},{"id":"b_220","day":45,"seller":"Светлана","contact":"","region":"Ленинградская область","city":"Красный Бор","views":29,"link":"https://www.avito.ru/krasnyy_bor/predlozheniya_uslug/rastamazhkaoformlenie_epts_sbkts_utilsbor_7915330051","offerIdx":0},{"id":"b_221","day":45,"seller":"Испытательная лаборатория ВИМ","contact":"Стюняков Павел Сергеевич","region":"Москва","city":"Москва","views":28,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/sbkts_epts_spisanie_utilsbora_ryadom_s_gibdd_8246289966","offerIdx":1},{"id":"b_222","day":45,"seller":"Светлана УТИЛЬ СБКТС","contact":"","region":"Санкт-Петербург","city":"Санкт-Петербург","views":25,"link":"https://www.avito.ru/sankt-peterburg/predlozheniya_uslug/spisanie_util_sbora_belarus_lgota_7876044470","offerIdx":2},{"id":"b_223","day":45,"seller":"Александр","contact":"","region":"Московская область","city":"Тучково","views":25,"link":"https://www.avito.ru/tuchkovo/predlozheniya_uslug/vykup_avto_avtovykup_tselye_bitye_posle_dtp_ne_na_h_8047758729","offerIdx":3},{"id":"b_224","day":45,"seller":"Микролайн-ВРН","contact":"","region":"Иркутская область","city":"Иркутск","views":23,"link":"https://www.avito.ru/irkutsk/predlozheniya_uslug/sbkts_epts_utilsbor_pod_klyuch_8079286256","offerIdx":4},{"id":"b_225","day":46,"seller":"TsvetkovCars","contact":"","region":"Москва","city":"Москва","views":22,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/tamozhennoe_oformlenie_sbkts_epts_zoets_util_8062234453","offerIdx":0},{"id":"b_226","day":46,"seller":"Камиль","contact":"","region":"Удмуртия","city":"Ижевск","views":21,"link":"https://www.avito.ru/izhevsk/predlozheniya_uslug/oformlenie_sbtks_epts_spisanie_utilsbora_8192183156","offerIdx":1},{"id":"b_227","day":46,"seller":"Пользователь","contact":"","region":"Ульяновская область","city":"Новоселки","views":20,"link":"https://www.avito.ru/novoselki/predlozheniya_uslug/utilizatsiya_avto_vyvoz_na_metallom_8246896126","offerIdx":2},{"id":"b_228","day":46,"seller":"Андрей","contact":"","region":"Московская область","city":"Мосрентген","views":19,"link":"https://www.avito.ru/mosrentgen/predlozheniya_uslug/rastamozhka_avto_pod_klyuch_8092318122","offerIdx":3},{"id":"b_229","day":46,"seller":"ОПТОВИК","contact":"Алексей","region":"Ставропольский край","city":"Елизаветинское","views":15,"link":"https://www.avito.ru/elizavetinskoe/predlozheniya_uslug/utilizatsionnyy_sbor_s_vydachey_tpo_4824228361","offerIdx":4},{"id":"b_230","day":47,"seller":"Ольга","contact":"","region":"Татарстан","city":"Набережные Челны","views":11,"link":"https://www.avito.ru/naberezhnye_chelny/predlozheniya_uslug/oformlenie_epts_sbkts_spisanie_utilsbora_v_rt_8214999543","offerIdx":0},{"id":"b_231","day":47,"seller":"Пользователь","contact":"","region":"Красноярский край","city":"Байкит","views":10,"link":"https://www.avito.ru/baykit/predlozheniya_uslug/vypiska_iz_epts_rasshirennaya_7793135574","offerIdx":1},{"id":"b_232","day":47,"seller":"Help.","contact":"","region":"Брянская область","city":"Брянск","views":5,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/oformlenie_ts_v_rf_8207396848","offerIdx":2},{"id":"b_233","day":47,"seller":"Никита","contact":"","region":"Брянская область","city":"Брянск","views":4,"link":"https://www.avito.ru/bryansk/predlozheniya_uslug/oformlenie_sbkts_epts_util_sbor_tamozhnya_8175666228","offerIdx":3},{"id":"b_234","day":47,"seller":"Виталий Подурару","contact":"Виталий","region":"Новосибирская область","city":"Новосибирск","views":3,"link":"https://www.avito.ru/novosibirsk/predlozheniya_uslug/vvoz_obraztsov_sertifikatsiya._belaya_dostavka_8132588964","offerIdx":4},{"id":"b_235","day":48,"seller":"Ли","contact":"","region":"Московская область","city":"Люберцы","views":2,"link":"https://www.avito.ru/lyubertsy/predlozheniya_uslug/oformlenie_sbkts_i_epts._utilizatsionnyy_sbor_7659689463","offerIdx":0},{"id":"b_236","day":48,"seller":"Альфина","contact":"","region":"Московская область","city":"Старая Купавна","views":2,"link":"https://www.avito.ru/staraya_kupavna/predlozheniya_uslug/kupit_avto_iz_kitaya_pod_klyuch_podbor_dostavka_rastamozhka_dogovor._elektromobili_vnedorozhniki_8175177007","offerIdx":1},{"id":"b_237","day":48,"seller":"Пользователь","contact":"Екатерина","region":"Москва","city":"Москва","views":2,"link":"https://www.avito.ru/moskva/predlozheniya_uslug/uslugi_po_ved_belyy_vvozoformleniesoprovozhdenie_7946767256","offerIdx":2},{"id":"b_238","day":48,"seller":"Пользователь","contact":"","region":"Ивановская область","city":"Иваново","views":2,"link":"https://www.avito.ru/ivanovo/predlozheniya_uslug/pokupka_avtomobilya_v_kitae_8211725508","offerIdx":3},{"id":"b_239","day":48,"seller":"AJIMPORT","contact":"Алексей","region":"Московская область","city":"Андреевка","views":1,"link":"https://www.avito.ru/andreevka/predlozheniya_uslug/rastamozhka_avto_oformlenie_epts_sbkts_8162873919","offerIdx":4}];
+const OFFERS = ["Здравствуйте! Понимаю, отвлекаю от работы — вместо меня тут должен быть клиент. Но предложу: списываю любой утиль, коммерция 8к, срок 1-2 дня. Льготный утиль — можем без ТПО, ПТД, без ФТС, так же с временной регистрацией, делаем ЭПСМ, Раритет! Так же можем выгрузить СБКТС, ЭПТС по вин номеру, скрин с сэпа СБКТС любой лаборатории!", "Здравствуйте! Знаю, что не клиент вам сейчас нужен, а я всё равно пишу. Списываю любой утиль, коммерция — 8к за 1-2 дня. Плюс льготный утиль без ТПО, ПТД, делаем ЭПСМ, Раритет, Армения, Казахстан! Без ФТС, так же с временной регистрацией! Выгрузим СБКТС, ЭПТС по вин номеру, скрин с сэпа СБКТС любой лаборатории!", "Здравствуйте! Понимаю, отвлекаю — на моём месте должен быть заказчик. Но предложу как коллега: утиль любой списываю, коммерция 8к, 1-2 дня. Льготный утиль можем без ТПО, ПТД, ЭПСМ, Раритет, без ФТС, так же с временной регистрацией! Выгружаем СБКТС, ЭПТС по вин номеру, скрин с сэпа СБКТС любой лаборатории!", "Здравствуйте! В идеале тут должен писать клиент, а не я — но рискну. Списываю любой утиль, коммерция 8к, срок 1-2 дня. Льготный утиль — без ТПО, без ФТС, так же с временной регистрацией! Так же можем выгрузить СБКТС, ЭПТС по вин номеру, скрин с сэпа СБКТС любой лаборатории!", "Добрый день! Понимаю, что отвлекаю от работы, вместо меня должен быть заказчик. Но всё же предложу: любой утиль списываю, коммерция — 8к, 1-2 дня, льготный без ТПО и ПТД, плюс ЭПСМ, Раритет, Армения, Казахстан! Без ФТС, так же с временной регистрацией! Так же можем выгрузить СБКТС, ЭПТС по вин номеру, скрин с сэпа СБКТС любой лаборатории!"];
+const HOOKS = ["Добрый день! Есть вопрос, удобно обсудить?", "Здравствуйте! Можно задать один вопрос?", "Добрый день! Удобно у вас пару минут уточнить кое-что?", "Здравствуйте! Есть вопрос по вашему объявлению, обсудим?", "Добрый день! Можно у вас пару слов уточнить?"];
+const TG_FALLBACK = ["Если удобно, могу написать вам в личку — чтобы контакт остался и было удобно задать любой вопрос!", "Могу написать вам в личку, если удобно — так контакт сохранится, и всегда можно будет что-то уточнить.", "Давайте я напишу вам в личные сообщения — контакт останется под рукой, если появятся вопросы.", "Если не против, напишу вам в личку — так будет проще держать связь и задавать вопросы.", "Могу написать в личные сообщения, если вам так удобнее — контакт не потеряется, и вопросы можно будет задать в любое время."];
+const CALL_SCRIPT = [{"label": "1. Представление", "text": "Здравствуйте! Меня зовут Владимир, занимаюсь оформлением утильсбора и СБКТС/ЭПТС в Петербурге."}, {"label": "2. Зацепка", "text": "Звоню не как клиент — по работе, мы с вами по одному профилю."}, {"label": "3. Суть (коротко)", "text": "Списываю любой утиль, коммерция — 8 тысяч за 1-2 дня. Есть льготный без ТПО и ФТС, делаем ЭПСМ, раритет, временную регистрацию, можем выгрузить СБКТС/ЭПТС по VIN."}, {"label": "4. Предложение", "text": "Предлагаю обмениваться заказами — то, что не по вашей части, отдавайте мне, а я вам."}, {"label": "5. Закрытие", "text": "Как часто у вас такое встречается? Обсудим условия?"}, {"label": "Если «не интересно»", "text": "Понимаю, спасибо за время. Если что — у вас есть мой контакт."}, {"label": "Если тянет с ответом", "text": "Могу скинуть всё в Телеграм, чтобы не потерялось — как вам удобнее?"}];
+const TEXT_TYPES = [
+  { key:'offer', label:'Оффер', list: OFFERS },
+  { key:'hook', label:'Крючок', list: HOOKS },
+  { key:'tg', label:'Просьба в TG', list: TG_FALLBACK },
+];
+const STORAGE_KEY = 'broker-status';
+
+const STATUS_META = {
+  new:         { label: 'Не написано',  short: null,             badge:'badge-new' },
+  sent:        { label: 'Написано',     short: 'НАПИСАНО',       badge:'badge-sent' },
+  replied:     { label: 'Ответил',      short: 'ОТВЕТИЛ',        badge:'badge-replied' },
+  negotiating: { label: 'Переговоры',   short: 'ПЕРЕГОВОРЫ',     badge:'badge-negotiating' },
+  won:         { label: 'Договорились', short: 'ДОГОВОРИЛИСЬ',   badge:'badge-won' },
+  lost:        { label: 'Отказ',        short: 'ОТКАЗ',          badge:'badge-lost' },
+  irrelevant:  { label: 'Отмена',       short: 'НЕ РЕЛЕВАНТНО',  badge:'badge-irrelevant' },
+};
+const STATUS_ORDER = ['new','sent','replied','negotiating','won','lost','irrelevant'];
+const ACTIVE_STATUSES = ['sent','replied','negotiating'];   // бакет «Отправлено» — в работе
+const RESOLVED_STATUSES = ['won','lost','irrelevant'];       // бакет «Остальные» — закрыто
+const STATUS_TO_BUCKET = { new:'new', sent:'sent', replied:'sent', negotiating:'sent', won:'other', lost:'other', irrelevant:'other' };
+
+let statusMap = {};
+let currentTab = 'day';
+let activeFilter = 'all';
+let searchTerm = '';
+let queueMode = 'new';         // 'new' | 'sent' | 'other'
+let queueStatusFilter = 'all'; // 'all' or a specific status key — overrides bucket highlighting
+function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
+function timeAgo(iso){
+  if(!iso) return '';
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const days = Math.floor(diffMs / 86400000);
+  if(days <= 0) return 'сегодня';
+  if(days === 1) return 'вчера';
+  return `${days} дн. назад`;
+}
+function getEntry(id){
+  const raw = statusMap[id];
+  if(!raw) return { status:'new', note:'', updatedAt:null, calledAt:null };
+  if(typeof raw === 'string') return { status:'sent', note:'', updatedAt: raw, calledAt:null };
+  return { status: raw.status || 'new', note: raw.note || '', updatedAt: raw.updatedAt || null, calledAt: raw.calledAt || null };
+}
+function setEntry(id, patch, touchUpdatedAt = true){
+  const cur = getEntry(id);
+  const next = { ...cur, ...patch };
+  if(touchUpdatedAt) next.updatedAt = new Date().toISOString();
+  if(next.status === 'new' && !next.note && !next.calledAt){ delete statusMap[id]; }
+  else statusMap[id] = next;
+  saveStatus();
+}
+function toggleCalled(id){
+  const cur = getEntry(id);
+  setEntry(id, { calledAt: cur.calledAt ? null : new Date().toISOString() }, false);
+}
+
+async function loadStatus(){
+  try{ const res = await window.storage.get(STORAGE_KEY, false); if(res && res.value) statusMap = JSON.parse(res.value); }
+  catch(e){ statusMap = {}; }
+}
+async function saveStatus(){
+  try{ await window.storage.set(STORAGE_KEY, JSON.stringify(statusMap), false); }catch(e){}
+}
+
+function showToast(msg){
+  const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 1400);
+}
+function copyText(text){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(()=>showToast('Текст скопирован')).catch(()=>fallbackCopy(text));
+  } else fallbackCopy(text);
+}
+function fallbackCopy(text){
+  const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+  try{ document.execCommand('copy'); showToast('Текст скопирован'); }catch(e){}
+  document.body.removeChild(ta);
+}
+
+function statusOptionsHTML(selected){
+  return STATUS_ORDER.map(s => `<option value="${s}" ${s===selected?'selected':''}>${STATUS_META[s].label}</option>`).join('');
+}
+
+function renderOverallBadge(){
+  const newCount = DATA.filter(d => getEntry(d.id).status === 'new').length;
+  const sentCount = DATA.filter(d => ACTIVE_STATUSES.includes(getEntry(d.id).status)).length;
+  const otherCount = DATA.filter(d => RESOLVED_STATUSES.includes(getEntry(d.id).status)).length;
+  const elNew = document.getElementById('qtNewCount');
+  const elSent = document.getElementById('qtSentCount');
+  const elOther = document.getElementById('qtOtherCount');
+  if(elNew) elNew.textContent = newCount;
+  if(elSent) elSent.textContent = sentCount;
+  if(elOther) elOther.textContent = otherCount;
+}
+
+/* ---------- QUEUE VIEW ---------- */
+const STATUS_RANK = { sent:0, replied:0, negotiating:0, won:1, lost:1, irrelevant:1 };
+
+function renderQueue(){
+  let items;
+  if(queueStatusFilter !== 'all'){
+    items = DATA.filter(d => getEntry(d.id).status === queueStatusFilter);
+  } else if(queueMode === 'new'){
+    items = DATA.filter(d => getEntry(d.id).status === 'new');
+  } else if(queueMode === 'sent'){
+    items = DATA.filter(d => ACTIVE_STATUSES.includes(getEntry(d.id).status));
+  } else {
+    items = DATA.filter(d => RESOLVED_STATUSES.includes(getEntry(d.id).status));
+  }
+
+  if(queueMode !== 'new'){
+    items = items.slice().sort((a, b) => {
+      const ea = getEntry(a.id), eb = getEntry(b.id);
+      const ra = STATUS_RANK[ea.status] ?? 0, rb = STATUS_RANK[eb.status] ?? 0;
+      if(ra !== rb) return ra - rb;
+      const ta = ea.updatedAt ? new Date(ea.updatedAt).getTime() : 0;
+      const tb = eb.updatedAt ? new Date(eb.updatedAt).getTime() : 0;
+      return tb - ta;
+    });
+  }
+
+  document.getElementById('qtNew').classList.toggle('active', queueMode==='new');
+  document.getElementById('qtSent').classList.toggle('active', queueMode==='sent');
+  document.getElementById('qtOther').classList.toggle('active', queueMode==='other');
+
+  const cardsEl = document.getElementById('cards');
+  const emptyEl = document.getElementById('emptyState');
+  cardsEl.innerHTML = '';
+
+  if(items.length === 0){
+    emptyEl.style.display = 'block';
+  } else {
+    emptyEl.style.display = 'none';
+    items.forEach(item => {
+      const entry = getEntry(item.id);
+      const meta = STATUS_META[entry.status];
+      const card = document.createElement('div');
+      card.className = 'card' + (RESOLVED_STATUSES.includes(entry.status) ? ' card-dim' : '');
+      const metaParts = [item.city || item.region].filter(Boolean);
+      if(item.contact) metaParts.push(item.contact);
+      card.innerHTML = `
+        ${meta.short ? `<div class="stamp">${meta.short}</div>` : ''}
+        <div class="card-top">
+          <div>
+            <div class="seller">${item.seller || 'Без имени'}</div>
+            <div class="meta">${metaParts.join(' · ')}</div>
+          </div>
+          <div class="views">👁 ${item.views.toLocaleString('ru-RU')}</div>
+        </div>
+        <div class="offer-tag">ОФФЕР №${item.offerIdx + 1}</div>
+        <div class="btn-row">
+          <a class="btn btn-open" href="${item.link}" target="_blank" rel="noopener">Объявление ↗</a>
+        </div>
+        <div class="texttype-row">
+          <select class="texttype-select" data-id="${item.id}" data-offer="${item.offerIdx}">${textTypeOptionsHTML()}</select>
+          <button class="btn-copytext" data-id="${item.id}" data-offer="${item.offerIdx}">Копировать</button>
+        </div>
+        <div class="call-row">
+          <button class="btn-call ${entry.calledAt ? 'active' : ''}" data-id="${item.id}">${entry.calledAt ? '📞 Звонили' : '📞 Отметить звонок'}</button>
+        </div>
+        ${entry.calledAt ? `<div class="called-note">звонок: ${timeAgo(entry.calledAt)}</div>` : ''}
+        <div class="status-row">
+          <select class="status-select" data-id="${item.id}">${statusOptionsHTML(entry.status)}</select>
+        </div>
+        <input type="text" class="note-input" data-id="${item.id}" placeholder="Заметка (необязательно)" value="${entry.note.replace(/"/g,'&quot;')}">
+        ${entry.updatedAt ? `<div class="updated-note">обновлено: ${timeAgo(entry.updatedAt)}</div>` : ''}
+      `;
+      cardsEl.appendChild(card);
+    });
+  }
+
+  renderOverallBadge();
+
+  cardsEl.querySelectorAll('.btn-copytext').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const sel = cardsEl.querySelector(`.texttype-select[data-id="${btn.getAttribute('data-id')}"]`);
+      const offerIdx = parseInt(btn.getAttribute('data-offer'));
+      copyText(textForType(sel.value, offerIdx));
+    });
+  });
+  cardsEl.querySelectorAll('.btn-call').forEach(btn=>{
+    btn.addEventListener('click', ()=>{ toggleCalled(btn.getAttribute('data-id')); renderQueue(); if(currentTab==='crm') renderCRM(); });
+  });
+  cardsEl.querySelectorAll('.status-select').forEach(sel=>{
+    sel.addEventListener('change', ()=>{ setEntry(sel.getAttribute('data-id'), { status: sel.value }); renderQueue(); if(currentTab==='crm') renderCRM(); });
+  });
+  cardsEl.querySelectorAll('.note-input').forEach(inp=>{
+    inp.addEventListener('change', ()=>{ setEntry(inp.getAttribute('data-id'), { note: inp.value }); renderOverallBadge(); });
+  });
+}
+
+function textTypeOptionsHTML(){
+  return TEXT_TYPES.map(t => `<option value="${t.key}">${t.label}</option>`).join('');
+}
+function textForType(typeKey, offerIdx){
+  const t = TEXT_TYPES.find(x => x.key === typeKey);
+  const list = t.list;
+  return list[offerIdx % list.length];
+}
+
+function renderOffersRef(){
+  const el = document.getElementById('offersRef');
+  el.innerHTML = TEXT_TYPES.map(t => `
+    <div class="ref-subhead">${t.label}</div>
+    ${t.list.map((text, i) => `
+      <div class="offer-item">
+        <div class="oi-label">№${i+1}</div>
+        <div>${text}</div>
+        <button class="oi-copy" data-key="${t.key}" data-idx="${i}">Копировать</button>
+      </div>
+    `).join('')}
+  `).join('');
+  el.querySelectorAll('.oi-copy').forEach(btn=>{
+    btn.addEventListener('click', ()=> copyText(textForType(btn.getAttribute('data-key'), parseInt(btn.getAttribute('data-idx')))));
+  });
+}
+
+function renderCallScript(){
+  const el = document.getElementById('callScriptRef');
+  el.innerHTML = CALL_SCRIPT.map(step => `
+    <div class="script-step">
+      <div class="ss-label">${step.label}</div>
+      <div>${step.text}</div>
+      <button class="oi-copy" data-text="${encodeURIComponent(step.text)}">Копировать</button>
+    </div>
+  `).join('');
+  el.querySelectorAll('.oi-copy').forEach(btn=>{
+    btn.addEventListener('click', ()=> copyText(decodeURIComponent(btn.getAttribute('data-text'))));
+  });
+}
+
+/* ---------- CRM VIEW ---------- */
+function computeCounts(){
+  const counts = { all: DATA.length, new:0, sent:0, replied:0, negotiating:0, won:0, lost:0, irrelevant:0 };
+  DATA.forEach(item => { counts[getEntry(item.id).status]++; });
+  return counts;
+}
+
+function renderChips(){
+  const counts = computeCounts();
+  const chipsEl = document.getElementById('chips');
+  const defs = [
+    ['all','Все'], ['replied','Ответил'], ['negotiating','Переговоры'], ['won','Договорились'],
+    ['sent','Написано'], ['new','Не написано'], ['lost','Отказ'], ['irrelevant','Отмена']
+  ];
+  chipsEl.innerHTML = defs.map(([key,label]) => `
+    <button class="chip ${activeFilter===key?'active':''}" data-key="${key}">${label} (${counts[key]})</button>
+  `).join('');
+  chipsEl.querySelectorAll('.chip').forEach(ch=>{
+    ch.addEventListener('click', ()=>{ activeFilter = ch.getAttribute('data-key'); renderCRM(); });
+  });
+}
+
+function renderCRM(){
+  renderChips();
+  const term = searchTerm.trim().toLowerCase();
+  let items = DATA.filter(item => {
+    const entry = getEntry(item.id);
+    if(activeFilter !== 'all' && entry.status !== activeFilter) return false;
+    if(term){
+      const hay = `${item.seller} ${item.city} ${item.region}`.toLowerCase();
+      if(!hay.includes(term)) return false;
+    }
+    return true;
+  });
+  items = items.slice().sort((a,b) => a.day - b.day);
+
+  const listEl = document.getElementById('crmList');
+  const emptyEl = document.getElementById('crmEmpty');
+  listEl.innerHTML = '';
+
+  if(items.length === 0){ emptyEl.style.display = 'block'; return; }
+  emptyEl.style.display = 'none';
+
+  items.forEach(item => {
+    const entry = getEntry(item.id);
+    const meta = STATUS_META[entry.status];
+    const det = document.createElement('details');
+    det.className = 'crm-row';
+    const metaParts = [`День ${item.day}`, item.city || item.region].filter(Boolean);
+    det.innerHTML = `
+      <summary>
+        <div class="dot status-dot-${entry.status}"></div>
+        <div class="crm-row-main">
+          <div class="crm-row-seller">${item.seller || 'Без имени'}</div>
+          <div class="crm-row-meta">${metaParts.join(' · ')}${entry.updatedAt ? ' · ' + timeAgo(entry.updatedAt) : ''}</div>
+        </div>
+        <div class="crm-row-badge ${meta.badge}">${entry.status==='new' ? '—' : meta.label.toUpperCase()}</div>
+      </summary>
+      <div class="crm-detail">
+        <div class="offer-tag">ОФФЕР №${item.offerIdx + 1}</div>
+        <div class="btn-row">
+          <a class="btn btn-open" href="${item.link}" target="_blank" rel="noopener">Объявление ↗</a>
+        </div>
+        <div class="texttype-row">
+          <select class="texttype-select" data-id="${item.id}" data-offer="${item.offerIdx}">${textTypeOptionsHTML()}</select>
+          <button class="btn-copytext" data-id="${item.id}" data-offer="${item.offerIdx}">Копировать</button>
+        </div>
+        <div class="call-row">
+          <button class="btn-call ${entry.calledAt ? 'active' : ''}" data-id="${item.id}">${entry.calledAt ? '📞 Звонили' : '📞 Отметить звонок'}</button>
+        </div>
+        ${entry.calledAt ? `<div class="called-note">звонок: ${timeAgo(entry.calledAt)}</div>` : ''}
+        <div class="status-row">
+          <select class="status-select" data-id="${item.id}">${statusOptionsHTML(entry.status)}</select>
+        </div>
+        <input type="text" class="note-input" data-id="${item.id}" placeholder="Заметка (необязательно)" value="${entry.note.replace(/"/g,'&quot;')}">
+      </div>
+    `;
+    listEl.appendChild(det);
+  });
+
+  listEl.querySelectorAll('.btn-copytext').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      e.preventDefault();
+      const sel = listEl.querySelector(`.texttype-select[data-id="${btn.getAttribute('data-id')}"]`);
+      const offerIdx = parseInt(btn.getAttribute('data-offer'));
+      copyText(textForType(sel.value, offerIdx));
+    });
+  });
+  listEl.querySelectorAll('.texttype-select').forEach(sel=>{
+    sel.addEventListener('click', e=>e.stopPropagation());
+  });
+  listEl.querySelectorAll('.btn-call').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{ e.preventDefault(); toggleCalled(btn.getAttribute('data-id')); renderCRM(); });
+  });
+  listEl.querySelectorAll('.status-select').forEach(sel=>{
+    sel.addEventListener('click', e=>e.stopPropagation());
+    sel.addEventListener('change', ()=>{ setEntry(sel.getAttribute('data-id'), { status: sel.value }); renderCRM(); renderOverallBadge(); });
+  });
+  listEl.querySelectorAll('.note-input').forEach(inp=>{
+    inp.addEventListener('click', e=>e.stopPropagation());
+    inp.addEventListener('change', ()=>{ setEntry(inp.getAttribute('data-id'), { note: inp.value }); });
+  });
+}
+
+/* ---------- NAV / INIT ---------- */
+document.querySelectorAll('.tabbar button').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    currentTab = btn.getAttribute('data-tab');
+    document.querySelectorAll('.tabbar button').forEach(b=>b.classList.toggle('active', b===btn));
+    document.getElementById('view-day').classList.toggle('active', currentTab==='day');
+    document.getElementById('view-crm').classList.toggle('active', currentTab==='crm');
+    if(currentTab==='crm') renderCRM();
+    else renderQueue();
+  });
+});
+
+document.getElementById('qtNew').addEventListener('click', ()=>{ queueMode = 'new'; queueStatusFilter = 'all'; document.getElementById('substatusSelect').value = 'all'; renderQueue(); });
+document.getElementById('qtSent').addEventListener('click', ()=>{ queueMode = 'sent'; queueStatusFilter = 'all'; document.getElementById('substatusSelect').value = 'all'; renderQueue(); });
+document.getElementById('qtOther').addEventListener('click', ()=>{ queueMode = 'other'; queueStatusFilter = 'all'; document.getElementById('substatusSelect').value = 'all'; renderQueue(); });
+document.getElementById('substatusSelect').addEventListener('change', (e)=>{
+  const val = e.target.value;
+  queueStatusFilter = val;
+  if(val !== 'all') queueMode = STATUS_TO_BUCKET[val];
+  renderQueue();
+});
+document.getElementById('searchInput').addEventListener('input', (e)=>{ searchTerm = e.target.value; renderCRM(); });
+
+(async function init(){
+  await loadStatus();
+  renderQueue();
+  renderOffersRef();
+  renderCallScript();
+  renderOverallBadge();
+})();
+</script>
+</body>
+</html>
