@@ -9,7 +9,9 @@
 /* ===== Адаптер хранилища: Telegram CloudStorage / localStorage ===== */
 (function(){
   var tg = window.Telegram && window.Telegram.WebApp;
-  var useCloud = !!(tg && tg.CloudStorage && tg.initData && tg.initData.length > 0);
+  var hasCS = !!(tg && tg.CloudStorage);
+  var hasInit = !!(tg && tg.initData && tg.initData.length > 0);
+  var useCloud = hasCS && hasInit;
 
   if (tg) {
     try { tg.ready(); tg.expand(); } catch(e){}
@@ -22,6 +24,20 @@
   var CHUNK = 1500; /* запас под лимит 4096 символов на ключ */
 
   function san(k){ return String(k).replace(/[^A-Za-z0-9_-]/g, '_'); }
+
+  function toast(msg, isError){
+    try {
+      if (typeof window.showToast === 'function'){ window.showToast(msg); return; }
+    } catch(e){}
+    var t = document.createElement('div');
+    t.textContent = msg;
+    t.style.cssText = 'position:fixed;left:50%;bottom:78px;transform:translateX(-50%);' +
+      'background:' + (isError ? '#B23A2E' : '#16233A') + ';color:#fff;padding:9px 15px;border-radius:20px;' +
+      'font-size:12.5px;z-index:10000;max-width:88%;text-align:center;box-shadow:0 4px 14px rgba(0,0,0,.25);' +
+      'font-family:-apple-system,sans-serif;';
+    document.body.appendChild(t);
+    setTimeout(function(){ t.remove(); }, isError ? 4200 : 2400);
+  }
 
   function cs(method){
     var args = Array.prototype.slice.call(arguments, 1);
@@ -65,7 +81,6 @@
       var metaObj = await cs('getItems', ['m_' + s]);
       var meta = metaObj['m_' + s];
       if (!meta){
-        /* в облаке пусто — пробуем локальную копию */
         return localApi.get(key);
       }
       var n = parseInt(meta, 10) || 1;
@@ -77,26 +92,31 @@
       return { key: key, value: out, shared: false };
     },
     set: async function(key, value){
-      var s = san(key);
-      value = String(value);
-      var n = Math.max(1, Math.ceil(value.length / CHUNK));
-      var old = 0;
       try {
-        var mo = await cs('getItems', ['m_' + s]);
-        old = parseInt(mo['m_' + s], 10) || 0;
-      } catch(e){}
-      for (var i = 0; i < n; i++){
-        await cs('setItem', 'c_' + s + '_' + i, value.substr(i * CHUNK, CHUNK));
+        var s = san(key);
+        value = String(value);
+        var n = Math.max(1, Math.ceil(value.length / CHUNK));
+        var old = 0;
+        try {
+          var mo = await cs('getItems', ['m_' + s]);
+          old = parseInt(mo['m_' + s], 10) || 0;
+        } catch(e){}
+        for (var i = 0; i < n; i++){
+          await cs('setItem', 'c_' + s + '_' + i, value.substr(i * CHUNK, CHUNK));
+        }
+        await cs('setItem', 'm_' + s, n + '|' + key);
+        if (old > n){
+          var rm = [];
+          for (var j = n; j < old; j++) rm.push('c_' + s + '_' + j);
+          try { await cs('removeItems', rm); } catch(e){}
+        }
+        try { localStorage.setItem('st_' + key, value); } catch(e){}
+        return { key: key, value: value, shared: false };
+      } catch(err){
+        try { localStorage.setItem('st_' + key, String(value)); } catch(e){}
+        toast('Не сохранилось в облако Телеграма (' + (err && (err.message || err)) + '). Сохранено временно в память браузера.', true);
+        throw err;
       }
-      await cs('setItem', 'm_' + s, n + '|' + key);
-      if (old > n){
-        var rm = [];
-        for (var j = n; j < old; j++) rm.push('c_' + s + '_' + j);
-        try { await cs('removeItems', rm); } catch(e){}
-      }
-      /* локальная резервная копия */
-      try { localStorage.setItem('st_' + key, value); } catch(e){}
-      return { key: key, value: value, shared: false };
     },
     "delete": async function(key){
       var s = san(key);
@@ -132,7 +152,14 @@
     window.storage = useCloud ? cloudApi : localApi;
   }
 
-  /* ===== Панель: перенос данных (экспорт / импорт) ===== */
+  function storageDiagText(){
+    if (!tg) return 'Открыто вне Telegram \u2014 тест в браузере (данные временные).';
+    if (!hasCS) return 'Облако Telegram недоступно в этой версии приложения \u2014 обновите Telegram до последней версии. Сейчас данные хранятся временно.';
+    if (!hasInit) return 'Telegram не передал данные запуска \u2014 попробуйте закрыть и открыть приложение заново через кнопку у бота.';
+    return 'Хранилище: облако Telegram (данные сохраняются на вашем аккаунте).';
+  }
+
+  /* ===== Панель: перенос данных + диагностика ===== */
   function buildPanel(){
     var css = document.createElement('style');
     css.textContent =
@@ -143,7 +170,7 @@
       'align-items:flex-end;justify-content:center;}' +
       '#syncOverlay.open{display:flex;}' +
       '#syncPanel{background:#fff;border-radius:16px 16px 0 0;width:100%;max-width:520px;padding:16px;' +
-      'font-family:"IBM Plex Sans",-apple-system,sans-serif;color:#16233A;}' +
+      'font-family:"IBM Plex Sans",-apple-system,sans-serif;color:#16233A;max-height:88vh;overflow-y:auto;}' +
       '#syncPanel h3{margin:0 0 10px;font-size:15px;}' +
       '#syncPanel textarea{width:100%;height:130px;border:1px solid #E2E6EC;border-radius:10px;padding:9px;' +
       'font-family:"IBM Plex Mono",monospace;font-size:11px;box-sizing:border-box;resize:vertical;}' +
@@ -153,7 +180,11 @@
       '#syncPanel button.primary{background:#1C4E80;color:#fff;border-color:#1C4E80;}' +
       '#syncPanel .home{display:block;text-align:center;margin-top:12px;font-size:13px;color:#1C4E80;' +
       'text-decoration:none;font-weight:600;}' +
-      '#syncPanel .hint{font-size:11.5px;color:#647089;margin:6px 0 0;}';
+      '#syncPanel .hint{font-size:11.5px;color:#647089;margin:6px 0 0;line-height:1.5;}' +
+      '#syncPanel .diag{font-size:11.5px;background:#F2F4F6;border-radius:10px;padding:8px 10px;margin-top:4px;' +
+      'line-height:1.5;}' +
+      '#syncPanel .diag.bad{background:#FBEAE8;color:#8A2A20;}' +
+      '#syncPanel .diag.ok{background:#E7F3EC;color:#1E6B44;}';
     document.head.appendChild(css);
 
     var btn = document.createElement('button');
@@ -163,33 +194,59 @@
     btn.textContent = '\u21C5';
     document.body.appendChild(btn);
 
+    var diagClass = (!tg || !hasCS || !hasInit) ? 'bad' : 'ok';
+
     var overlay = document.createElement('div');
     overlay.id = 'syncOverlay';
     overlay.innerHTML =
       '<div id="syncPanel">' +
         '<h3>Перенос данных</h3>' +
+        '<div class="diag ' + diagClass + '" id="syncDiag">' + storageDiagText() + '</div>' +
+        '<div class="row"><button type="button" id="syncTest">Проверить сохранение</button></div>' +
         '<textarea id="syncArea" placeholder="Здесь появятся данные при выгрузке. Для загрузки — вставьте сюда данные и нажмите \u00ABЗагрузить\u00BB."></textarea>' +
         '<div class="row">' +
           '<button type="button" id="syncExport">Выгрузить данные</button>' +
           '<button type="button" id="syncImport" class="primary">Загрузить данные</button>' +
         '</div>' +
         '<div class="row"><button type="button" id="syncClose">Закрыть</button></div>' +
-        '<p class="hint" id="syncHint">Хранилище: ' + (useCloud ? 'облако Телеграма' : 'память браузера') + '</p>' +
         '<a class="home" href="index.html">\u2190 К выбору списка</a>' +
       '</div>';
     document.body.appendChild(overlay);
 
     var area = overlay.querySelector('#syncArea');
-    var hint = overlay.querySelector('#syncHint');
+    var hint = overlay.querySelector('#syncDiag');
 
     btn.addEventListener('click', function(){ overlay.classList.add('open'); });
     overlay.querySelector('#syncClose').addEventListener('click', function(){ overlay.classList.remove('open'); });
     overlay.addEventListener('click', function(e){ if (e.target === overlay) overlay.classList.remove('open'); });
 
+    overlay.querySelector('#syncTest').addEventListener('click', async function(){
+      hint.className = 'diag';
+      hint.textContent = 'Проверяю\u2026';
+      var testKey = '__diag_test__';
+      var testVal = 'ok-' + Date.now();
+      try {
+        await window.storage.set(testKey, testVal);
+        var res = await window.storage.get(testKey);
+        if (res && res.value === testVal){
+          hint.className = 'diag ok';
+          hint.textContent = useCloud
+            ? 'Сохранение работает: данные пишутся в облако Telegram. Проверено ' + new Date().toLocaleTimeString('ru-RU') + '.'
+            : 'Тест прошёл, но пишется во временную память браузера (без облака Telegram) — при переоткрытии приложения данные могут потеряться. ' + storageDiagText();
+        } else {
+          hint.className = 'diag bad';
+          hint.textContent = 'Тест не прошёл: записанное значение не совпало с прочитанным.';
+        }
+      } catch(err){
+        hint.className = 'diag bad';
+        hint.textContent = 'Ошибка сохранения: ' + (err && (err.message || err)) + '. ' + storageDiagText();
+      }
+    });
+
     overlay.querySelector('#syncExport').addEventListener('click', function(){
       window.storage.list('').then(function(res){
-        var keys = (res && res.keys) || [];
-        if (!keys.length){ area.value = '{}'; hint.textContent = 'Данных пока нет.'; return; }
+        var keys = ((res && res.keys) || []).filter(function(k){ return k.indexOf('__diag_test__') !== 0; });
+        if (!keys.length){ area.value = '{}'; return; }
         var dump = {};
         var chain = Promise.resolve();
         keys.forEach(function(k){
@@ -200,30 +257,30 @@
         chain.then(function(){
           area.value = JSON.stringify(dump);
           area.select();
-          try { document.execCommand('copy'); hint.textContent = 'Данные выгружены и скопированы в буфер.'; }
-          catch(e){ hint.textContent = 'Данные выгружены — скопируйте текст вручную.'; }
+          try { document.execCommand('copy'); toast('Данные выгружены и скопированы в буфер.'); }
+          catch(e){ toast('Данные выгружены — скопируйте текст вручную.'); }
         });
       });
     });
 
     overlay.querySelector('#syncImport').addEventListener('click', function(){
       var txt = area.value.trim();
-      if (!txt){ hint.textContent = 'Поле пустое — вставьте данные для загрузки.'; return; }
+      if (!txt){ toast('Поле пустое — вставьте данные для загрузки.', true); return; }
       var data;
       try { data = JSON.parse(txt); }
-      catch(e){ hint.textContent = 'Не удалось прочитать данные: проверьте, что вставлен весь текст целиком.'; return; }
+      catch(e){ toast('Не удалось прочитать данные: проверьте, что вставлен весь текст целиком.', true); return; }
       var keys = Object.keys(data);
-      if (!keys.length){ hint.textContent = 'В данных нет записей.'; return; }
-      hint.textContent = 'Загружаю\u2026';
+      if (!keys.length){ toast('В данных нет записей.', true); return; }
+      toast('Загружаю\u2026');
       var chain = Promise.resolve();
       keys.forEach(function(k){
         chain = chain.then(function(){ return window.storage.set(k, data[k]); });
       });
       chain.then(function(){
-        hint.textContent = 'Готово. Обновляю страницу\u2026';
+        toast('Готово. Обновляю страницу\u2026');
         setTimeout(function(){ location.reload(); }, 600);
       }).catch(function(){
-        hint.textContent = 'Часть данных не загрузилась — попробуйте ещё раз.';
+        toast('Часть данных не загрузилась — попробуйте ещё раз.', true);
       });
     });
   }
