@@ -6,17 +6,21 @@
 <title>Картотека рассылки</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg: #F2F4F6;
-    --card: #FFFFFF;
-    --ink: #16233A;
-    --ink-soft: #647089;
-    --border: #E2E6EC;
-    --accent: #1C4E80;
-    --accent-soft: #E4ECF4;
-    --stamp: #B23A2E;
+    --bg: #ECEEE6;
+    --card: #FBFBF6;
+    --ink: #17241E;
+    --ink-soft: #56695F;
+    --border: #D9DBC9;
+    --accent: #2C3E63;
+    --accent-soft: #E2E6F0;
+    --accent2: #3F5D3A;
+    --accent2-soft: #E3EAE0;
+    --accent3: #6B3446;
+    --accent3-soft: #F1E1E6;
+    --stamp: #A33B2E;
   }
   *{box-sizing:border-box;}
   html,body{margin:0;padding:0;}
@@ -30,45 +34,60 @@
   .mono{font-family:'IBM Plex Mono', monospace;}
   #app{max-width:520px;margin:0 auto;padding:26px 16px 40px;}
 
-  .head{position:relative; margin-bottom:22px;}
-  .head h1{font-size:21px;margin:0;font-weight:700;letter-spacing:-0.01em;}
-  .head .sub{font-size:12.5px;color:var(--ink-soft);margin-top:4px;}
+  .head{position:relative; margin-bottom:22px; padding-bottom:16px; border-bottom:1px solid var(--border);}
+  .head h1{font-family:'Fraunces', serif; font-size:23px;margin:0;font-weight:600;letter-spacing:-0.01em;}
+  .head .sub{font-size:12px;color:var(--ink-soft);margin-top:5px;}
   .stamp{
-    position:absolute; right:0; top:-4px;
-    font-family:'IBM Plex Mono',monospace; font-size:10px; font-weight:700;
-    color:var(--stamp); border:1.5px solid var(--stamp); border-radius:4px;
-    padding:4px 8px; letter-spacing:0.14em; transform:rotate(-6deg);
-    opacity:0.85; user-select:none;
+    position:absolute; right:0; top:-6px;
+    width:60px; height:60px; border-radius:50%;
+    font-family:'IBM Plex Mono',monospace; font-size:9px; font-weight:700;
+    color:var(--stamp); border:2px solid var(--stamp);
+    display:flex; align-items:center; justify-content:center; text-align:center;
+    letter-spacing:0.08em; transform:rotate(-8deg);
+    opacity:0.9; user-select:none; background:rgba(255,255,255,.7); line-height:1.2; padding:4px;
+  }
+  .stamp::before{
+    content:''; position:absolute; inset:4px; border:1px solid var(--stamp); border-radius:50%; opacity:.55;
   }
 
   .lists{display:flex;flex-direction:column;gap:12px;}
   a.list-card{
     display:flex; align-items:center; gap:14px;
-    background:var(--card); border:1px solid var(--border); border-radius:16px;
+    background:var(--card); border:1px solid var(--border); border-radius:4px;
     padding:18px 16px; text-decoration:none; color:var(--ink);
-    transition:transform .08s ease;
+    transition:transform .08s ease; border-left:3px solid var(--accent);
   }
-  a.list-card:active{transform:scale(0.985); background:#FBFCFD;}
+  a.list-card.as{ border-left-color:var(--accent2); }
+  a.list-card.tg{ border-left-color:var(--accent3); }
+  a.list-card:active{transform:scale(0.985); background:#F5F6EF;}
   .tab{
-    width:46px; height:54px; flex-shrink:0; border-radius:6px 12px 6px 6px;
+    width:46px; height:54px; flex-shrink:0; border-radius:2px 8px 2px 2px;
     background:var(--accent-soft); border:1px solid var(--border);
     position:relative;
   }
+  .tab.as{ background:var(--accent2-soft); }
+  .tab.tg{ background:var(--accent3-soft); }
   .tab::before{
     content:''; position:absolute; top:-6px; left:6px;
     width:20px; height:8px; background:var(--accent-soft);
-    border:1px solid var(--border); border-bottom:none; border-radius:4px 4px 0 0;
+    border:1px solid var(--border); border-bottom:none; border-radius:2px 2px 0 0;
   }
+  .tab.as::before{ background:var(--accent2-soft); }
+  .tab.tg::before{ background:var(--accent3-soft); }
   .tab span{
     position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
     font-family:'IBM Plex Mono',monospace; font-weight:700; font-size:13px; color:var(--accent);
   }
+  .tab.as span{ color:var(--accent2); }
+  .tab.tg span{ color:var(--accent3); }
   .list-card .txt{flex:1; min-width:0;}
-  .list-card .title{font-weight:700; font-size:16px;}
+  .list-card .title{font-weight:600; font-size:16.5px; font-family:'Fraunces',serif;}
   .list-card .desc{font-size:12.5px; color:var(--ink-soft); margin-top:3px;}
   .list-card .go{
     font-family:'IBM Plex Mono',monospace; color:var(--accent); font-size:18px; flex-shrink:0;
   }
+  .list-card.as .go{ color:var(--accent2); }
+  .list-card.tg .go{ color:var(--accent3); }
 
   .foot{
     margin-top:26px; font-size:11.5px; color:var(--ink-soft); line-height:1.55;
@@ -82,12 +101,12 @@
   <div class="head">
     <h1>Картотека рассылки</h1>
     <div class="sub mono" id="today"></div>
-    <div class="stamp">КАРТОТЕКА</div>
+    <div class="stamp">КАРТО<br>ТЕКА</div>
   </div>
 
   <div class="lists">
-    <a class="list-card" href="brokery.html">
-      <div class="tab"><span>БР</span></div>
+    <a class="list-card br" href="brokery.html">
+      <div class="tab br"><span>БР</span></div>
       <div class="txt">
         <div class="title">Брокеры</div>
         <div class="desc">Коллеги-брокеры · офферы и ответы</div>
@@ -95,11 +114,20 @@
       <div class="go">&rarr;</div>
     </a>
 
-    <a class="list-card" href="avtosalony.html">
-      <div class="tab"><span>АС</span></div>
+    <a class="list-card as" href="avtosalony.html">
+      <div class="tab as"><span>АС</span></div>
       <div class="txt">
         <div class="title">Автосалоны</div>
         <div class="desc">Заказчики · офферы и ответы</div>
+      </div>
+      <div class="go">&rarr;</div>
+    </a>
+
+    <a class="list-card tg" href="telegram.html">
+      <div class="tab tg"><span>ТГ</span></div>
+      <div class="txt">
+        <div class="title">Telegram</div>
+        <div class="desc">Каналы и чаты · 1160 контактов</div>
       </div>
       <div class="go">&rarr;</div>
     </a>
