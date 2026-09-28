@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Брокеры 2 — картотека</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#eceee6;--card:#fbfbf6;--ink:#17241e;--soft:#56695f;--line:#d9dbc9;--blue:#2c3e63;--green:#3f5d3a;--red:#8c3d35}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}#app{max-width:760px;margin:auto;padding:18px 14px 50px}.head{border-bottom:1px solid var(--line);padding:5px 0 15px;margin-bottom:15px}.head h1{font-size:23px;margin:0 0 5px}.sub{font-size:12px;color:var(--soft)}.back{color:var(--blue);text-decoration:none;font-size:13px;display:inline-block;margin-bottom:10px}.summary{background:var(--card);border:1px solid var(--line);padding:12px;border-radius:8px;margin-bottom:12px;font-size:13px;color:var(--soft)}.toolbar{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}.toolbar input,.toolbar select{min-width:0;padding:11px;border:1px solid var(--line);background:var(--card);border-radius:7px;font-size:14px;color:var(--ink)}.tabs{display:flex;gap:6px;overflow:auto;padding:2px 0 10px}.tab{white-space:nowrap;border:1px solid var(--line);border-radius:18px;background:var(--card);padding:8px 11px;color:var(--ink);font-size:12px}.tab.active{background:var(--blue);border-color:var(--blue);color:white}.cards{display:grid;gap:10px}.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:13px}.cardtop{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.name{font-weight:700;font-size:16px;overflow-wrap:anywhere}.meta{color:var(--soft);font-size:12px;line-height:1.5;margin-top:5px}.pill{font-size:10px;padding:4px 7px;border-radius:12px;background:#e2e6f0;color:var(--blue);white-space:nowrap}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:11px}.btn{border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:#fff;color:var(--ink);text-decoration:none;font-size:12px;cursor:pointer}.btn.primary{background:var(--blue);border-color:var(--blue);color:white}.btn.offer{background:#e3eae0;border-color:#d2ddce;color:#294328}.status{margin-top:10px;width:100%;padding:10px;border-radius:6px;border:1px solid var(--line);background:white;font-size:14px}.ads{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}.ads summary{font-size:12px;color:var(--blue);cursor:pointer}.adrow{font-size:12px;margin:8px 0;line-height:1.45}.adrow a{color:var(--blue)}.empty{text-align:center;color:var(--soft);padding:30px}.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#17241e;color:#fff;padding:10px 15px;border-radius:20px;font-size:13px;display:none}.hint{font-size:11px;color:var(--soft);margin:10px 2px}@media(min-width:600px){.cards{grid-template-columns:1fr 1fr}}
+</style></head>
+<body><main id="app">
+<a class="back" href="index.html">← Картотека</a>
+<header class="head"><h1>Брокеры 2</h1><div class="sub">Новые контакты Авито · выгрузка 12.09.2026 · <span id="total"></span></div></header>
+<div class="summary">Оффер: списание утиля, СБКТС, ЭПТС и ЭПСМ. Карточки сгруппированы по продавцам и похожести текста объявлений.</div>
+<div class="toolbar"><input id="search" placeholder="Поиск по продавцу или городу"><select id="city"><option value="">Все города</option></select></div>
+<nav class="tabs" id="tabs"></nav><section class="cards" id="cards"></section><div class="hint" id="storageHint"></div>
+</main><div class="toast" id="toast"></div>
+<script>
+const OFFER = `Здравствуйте! В идеале тут должен писать клиент, а не я — но рискну.
+
+Списываю любой утиль:
+комм. по ТПО 8т.р / срок 1-2 дня.
+Льготный утиль по ТПО -13 тыс
+Льготный утиль РБ — без ТПО, по скану ТПО, ( от 20 тыс )
+Коммерческий по ДТ, (казахстанская сборка)
+Армения / Казахстан - льготный / комм.
+Раритет - утиль 0,
+Выпускаем и списываем ЭПСМ!
+
+Так же можем выгрузить СБКТС, ЭПТС по вин номеру, скрин с сэпа СБКТС любой лаборатории, внести собственника в любой ЭПТС!`;
+const STATUSES=[['new','Новые'],['sent','Написал'],['agreed','Договорился'],['closed','Отказ / не тема']];
+const KEY='broker2_status_v1';let DATA=[],STATE={},active='new',saveTimer;
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function toast(s){let t=document.getElementById('toast');t.textContent=s;t.style.display='block';setTimeout(()=>t.style.display='none',1800)}
+function adaptStorage(){const tg=window.Telegram&&Telegram.WebApp,cs=tg&&tg.CloudStorage,cloud=!!(cs&&tg.initData);if(tg){try{tg.ready();tg.expand();tg.BackButton.show();tg.BackButton.onClick(()=>location.href='index.html')}catch(e){}}
+const local={get:async()=>localStorage.getItem(KEY),set:async v=>localStorage.setItem(KEY,v)};
+if(!cloud)return {get:local.get,set:local.set,cloud:false};
+const call=(m,...a)=>new Promise((ok,no)=>cs[m](...a,(e,v)=>e?no(e):ok(v)));
+return {cloud:true,get:async()=>{let o=await call('getItem',KEY);return o||localStorage.getItem(KEY)},set:async v=>{await call('setItem',KEY,v);localStorage.setItem(KEY,v)}}}
+const STORE=adaptStorage();
+function renderTabs(){let counts={};for(const [k] of STATUSES)counts[k]=DATA.filter(x=>(STATE[x.id]?.status||'new')===k).length;document.getElementById('tabs').innerHTML=STATUSES.map(([k,n])=>`<button class="tab ${k===active?'active':''}" data-status="${k}">${n} · ${counts[k]}</button>`).join('');document.getElementById('tabs').querySelectorAll('button').forEach(b=>b.onclick=()=>{active=b.dataset.status;render()})}
+function render(){renderTabs();let q=document.getElementById('search').value.trim().toLowerCase(),city=document.getElementById('city').value;let items=DATA.filter(x=>(STATE[x.id]?.status||'new')===active).filter(x=>!city||x.cities.includes(city)).filter(x=>!q||(x.name+' '+x.cities.join(' ')).toLowerCase().includes(q));let root=document.getElementById('cards');if(!items.length){root.innerHTML='<div class="empty">В этом разделе карточек нет</div>';return}root.innerHTML=items.map(x=>{let ads=x.ads||[],first=ads[0]||{},note=STATE[x.id]?.note||'';return `<article class="card"><div class="cardtop"><div><div class="name">${esc(x.name)}</div><div class="meta">${esc(x.cities.slice(0,5).join(', '))}${x.cities.length>5?' и ещё '+(x.cities.length-5):''}<br>${x.listingCount} объявл. · ${x.views} просмотров суммарно · сегодня ${x.todayViews||0}</div></div><span class="pill">${x.grouping==='description ≥80%'?'Совпадение текста':x.grouping==='same seller name'?'Имя продавца':'Отдельный контакт'}</span></div><div class="actions"><a class="btn primary" href="${esc(first.url||'#')}" target="_blank" rel="noopener">Объявление ↗</a><button class="btn offer" data-copy="${esc(x.id)}">Копировать оффер</button></div><select class="status" data-id="${esc(x.id)}">${STATUSES.map(([k,n])=>`<option value="${k}" ${(STATE[x.id]?.status||'new')===k?'selected':''}>${n}</option>`).join('')}</select><input class="status note" data-note="${esc(x.id)}" value="${esc(note)}" placeholder="Заметка (необязательно)">${ads.length>1?`<details class="ads"><summary>Все объявления (${ads.length})</summary>${ads.map(a=>`<div class="adrow">${esc(a.city)} · ${a.views} просмотров ${a.promotion?'· '+esc(a.promotion):''}<br><a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.title||'Открыть объявление')} ↗</a></div>`).join('')}</details>`:''}</article>`}).join('');
+root.querySelectorAll('select[data-id]').forEach(el=>el.onchange=()=>{STATE[el.dataset.id]={...(STATE[el.dataset.id]||{}),status:el.value};scheduleSave();render()});root.querySelectorAll('[data-note]').forEach(el=>el.oninput=()=>{STATE[el.dataset.note]={...(STATE[el.dataset.note]||{}),note:el.value};scheduleSave()});root.querySelectorAll('[data-copy]').forEach(el=>el.onclick=async()=>{try{await navigator.clipboard.writeText(OFFER);toast('Оффер скопирован')}catch(e){let t=document.createElement('textarea');t.value=OFFER;document.body.append(t);t.select();document.execCommand('copy');t.remove();toast('Оффер скопирован')}})}
+function scheduleSave(){clearTimeout(saveTimer);saveTimer=setTimeout(async()=>{try{await STORE.set(JSON.stringify(STATE))}catch(e){toast('Не удалось сохранить статус в Telegram')}} ,350)}
+async function start(){try{let r=await fetch('brokery2-data.json');let d=await r.json();DATA=d.contacts||[];document.getElementById('total').textContent=DATA.length+' контактов';let cities=[...new Set(DATA.flatMap(x=>x.cities||[]))].sort((a,b)=>a.localeCompare(b,'ru'));document.getElementById('city').innerHTML='<option value="">Все города</option>'+cities.map(c=>`<option>${esc(c)}</option>`).join('');let saved=await STORE.get();if(saved)STATE=JSON.parse(saved);document.getElementById('storageHint').textContent=STORE.cloud?'Статусы сохраняются в облаке Telegram.':'Открыто вне Telegram: статусы сохранены в браузере этого устройства.';render()}catch(e){document.getElementById('cards').innerHTML='<div class="empty">Не удалось загрузить список. Обновите страницу.</div>'}}
+document.getElementById('search').oninput=render;document.getElementById('city').onchange=render;start();
+</script></body></html>
