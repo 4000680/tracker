@@ -1,0 +1,19 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключение Google Таблицы</title><link rel="stylesheet" href="../labs.css?v=2"></head><body><main id="app">
+<a class="back" href="../laboratorii.html">← Лаборатории</a><h1>Подключить Google Таблицу</h1>
+<p>Разовая настройка с компьютера. После неё записи из карточек будут автоматически попадать в одну таблицу на вашем Диске.</p>
+<ol style="padding-left:22px;line-height:1.7">
+<li>Откройте <a href="https://docs.google.com/spreadsheets/d/1CFu2d_uNfeQIEBAiivHlWy-UIcPS2S7Srs5voW00s_Y/edit" target="_blank" rel="noopener noreferrer">таблицу «Лаборатории — Грани»</a>.</li>
+<li>В меню таблицы выберите <strong>Расширения → Apps Script</strong>.</li>
+<li>Удалите только пример <code>myFunction</code> в новом проекте. Скопируйте весь код ниже и вставьте вместо примера. Сохраните проект под именем «Грани — синхронизация лабораторий».</li>
+<li>Вверху выберите функцию <code>setupLabsSync</code>, нажмите <strong>Выполнить</strong> и разрешите этому проекту изменять вашу таблицу. После выполнения в журнале появится <strong>КОД ПОДКЛЮЧЕНИЯ</strong>. Сохраните его для шага 6. Код даёт доступ к записи в эту таблицу — вводите его только в настройках трекера.</li>
+<li>Нажмите <strong>Начать развёртывание → Новое развёртывание</strong> (названия могут немного отличаться). Тип — <strong>Веб-приложение</strong>. «Выполнять от имени» — <strong>Я</strong>. «У кого есть доступ» — <strong>Все</strong>. Нажмите «Развернуть» и скопируйте URL веб-приложения, заканчивающийся на <code>/exec</code>. Саму Google Таблицу публиковать или открывать для всех не нужно.</li>
+<li>В своём Telegram-боте откройте трекер → «Лаборатории» → <strong>Подключить Google</strong>. Вставьте URL и код из шага 4. Нажмите <strong>Проверить и подключить</strong>.</li>
+</ol>
+<p>Трекер отправит уже внесённые записи и будет отправлять новые после сохранения. При сбое запись останется в Telegram, а приложение покажет, что Google ещё не обновлён. Можно повторить отправку кнопкой «Синхронизировать». Редактируйте рабочие данные в карточках: обратной загрузки изменений из Google нет.</p>
+<button id="copy" disabled>Копировать код целиком</button><p id="message" class="muted" role="status">Загружаем код…</p><textarea id="code" readonly rows="16" aria-label="Код Google Apps Script" spellcheck="false" style="font:12px monospace"></textarea>
+<p class="muted">Если интерфейс Google выглядит иначе, остановитесь на этом шаге и пришлите скриншот без кода подключения. Подтверждать подключение можно только после успешной проверки в трекере.</p>
+</main><script>
+const code=document.getElementById('code'),button=document.getElementById('copy'),message=document.getElementById('message');
+fetch('Code.gs?v=1').then(r=>{if(!r.ok)throw Error();return r.text()}).then(text=>{code.value=text;button.disabled=false;message.textContent='Код подготовлен для вашей таблицы.'}).catch(()=>message.textContent='Не удалось загрузить код. Обновите страницу.');
+button.onclick=async()=>{try{await navigator.clipboard.writeText(code.value);message.textContent='Код скопирован. Вставьте его в Apps Script.'}catch{code.focus();code.select();message.textContent='Код выделен. Скопируйте его обычной командой копирования.'}};
+</script></body></html>

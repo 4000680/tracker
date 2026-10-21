@@ -1,9 +1,18 @@
 import {FIELDS,STATUSES,esc,encode,decode,statusOf,filterLabs,nextLab,csvText,parseBackup,createStore} from './labs-core.mjs';
+import {createGoogleSync} from './labs-google.mjs';
 const $=id=>document.getElementById(id),tg=window.Telegram?.WebApp;
 const store=createStore(tg,window.localStorage);
 const titles={address:'Адреса и режим работы',prices:'Категории и цены',cooperation:'Сотрудничество',comment:'Комментарий',call:'Результат звонка'};
 const hints={address:'Города, фактические адреса, свои или партнёрские площадки, график и запись.',prices:'Категории ТС, услуги и документы, цена клиенту и партнёру, сроки, доплаты и ограничения.',cooperation:'Что предложили по утильсбору, ответ, возражения, условия и следующий шаг.',comment:'Любые дополнительные сведения и договорённости.',call:'Отметьте результат и при необходимости дату следующего звонка.'};
 let labs=[],state={},current=null,field=null,busy=false,initial='',toastTimer;
+let googleSync=null,googleBusy=false;
+function googleStatus(info){
+ $('google-settings').textContent=info.connected?'Настройки Google':'Подключить Google';
+ $('google-retry').disabled=!info.connected||info.running||googleBusy;
+ $('google-status').textContent=info.error?'Записи в Telegram сохранены. Google: '+info.error+(info.pending?' Ожидают отправки: '+info.pending+'.':''):info.running?'Обновляем Google Таблицу… Осталось записей: '+info.pending:info.connected?(info.pending?'Ожидают отправки в Google: '+info.pending:'Все внесённые записи отправлены в Google Таблицу.'):'Таблица создана. Подключите автоматическое сохранение один раз.';
+ $('google-status').className=info.error?'error':'muted';
+}
+function syncGoogle(){googleSync?.report();void googleSync?.sync();}
 function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,3500);}
 function errorMessage(e){return e?.message||String(e);}
 function updateBack(){try{if(tg){tg.BackButton.show();}}catch{}}
@@ -40,7 +49,7 @@ async function save(event){
  event.preventDefault();if(busy)return;
  let raw;try{raw=encode(field,formValue());}catch(e){$('edit-error').textContent=errorMessage(e);return;}
  busy=true;$('save').disabled=true;$('cancel-edit').disabled=true;$('save').textContent='Сохраняем…';$('edit-error').textContent='';
- try{await store.save(current,field,raw);(state[current]??={})[field]=decode(field,raw);$('editor').close();drawCard();render();toast(store.cloud?'Сохранено в Telegram':'Сохранено на этом устройстве');}
+ try{await store.save(current,field,raw);(state[current]??={})[field]=decode(field,raw);$('editor').close();drawCard();render();toast(store.cloud?'Сохранено в Telegram':'Сохранено на этом устройстве');syncGoogle();}
  catch(e){$('edit-error').textContent='Не удалось сохранить. Текст остался в поле. '+errorMessage(e);}
  finally{busy=false;$('save').disabled=false;$('cancel-edit').disabled=false;$('save').textContent='Сохранить';}
 }
@@ -59,17 +68,18 @@ async function restore(file){
  busy=true;toggleControls(true);let done=0;
  try{for(const item of writes){await store.save(item.id,item.field,item.raw);(state[item.id]??={})[item.field]=decode(item.field,item.raw);done++;}toast('Копия загружена');}
  catch(e){window.alert(`Загружено ${done} из ${writes.length} записей. Загрузка остановлена: ${errorMessage(e)}. Можно повторно загрузить тот же файл.`);}
- finally{busy=false;toggleControls(false);render();}
+ finally{busy=false;toggleControls(false);render();syncGoogle();}
 }
 function toggleControls(disabled){for(const id of ['next','export','backup','restore','search','filter'])$(id).disabled=disabled;$('list').inert=disabled;}
 async function start(){
  toggleControls(true);
- try{try{tg?.ready();tg?.expand();tg?.BackButton.onClick(()=>{if($('editor').open)cancelEditor();else if($('card').open)closeCard();else location.href='index.html';});updateBack();}catch{}
+ try{try{tg?.ready();tg?.expand();tg?.BackButton.onClick(()=>{if($('google-dialog').open)$('google-cancel').click();else if($('editor').open)cancelEditor();else if($('card').open)closeCard();else location.href='index.html';});updateBack();}catch{}
   const response=await fetch('labs-data.json?v=1');if(!response.ok)throw new Error('Не удалось загрузить список');
   labs=(await response.json()).laboratories;if(!Array.isArray(labs)||labs.length!==64)throw new Error('Некорректный список организаций');
   state=await store.load(labs);
   $('storage').textContent=store.cloud?'Записи сохраняются в облаке Telegram и доступны с другого устройства в этом же боте.':'Открыто вне мини-приложения Telegram. Записи сохраняются только в этом браузере. Для облачного сохранения откройте трекер кнопкой в боте.';
   $('storage').className=store.cloud?'':'warning';toggleControls(false);render();
+  googleSync=createGoogleSync({tg,local:window.localStorage,labs,getState:()=>state,onStatus:googleStatus});await googleSync.init();$('google-settings').disabled=false;syncGoogle();
  }catch(e){$('storage').textContent='Записи не загружены. '+errorMessage(e);$('storage').className='error';$('list').innerHTML='<button id="retry" type="button">Повторить загрузку</button>';$('list').inert=false;$('retry').onclick=()=>location.reload();}
 }
 $('search').oninput=render;$('filter').onchange=render;
@@ -81,5 +91,11 @@ $('cancel-edit').onclick=cancelEditor;$('edit-form').onsubmit=save;$('edit-text'
 $('export').onclick=()=>download('Laboratorii_GRANI.csv',csvText(labs,state),'text/csv;charset=utf-8').catch(e=>toast(errorMessage(e)));
 $('backup').onclick=()=>download('Laboratorii_GRANI_backup.json',JSON.stringify({format:'grani-labs-v1',exportedAt:new Date().toISOString(),state},null,2),'application/json').catch(e=>toast(errorMessage(e)));
 $('restore').onclick=()=>$('file').click();$('file').onchange=()=>{const file=$('file').files[0];$('file').value='';restore(file);};
+$('google-settings').onclick=()=>{const config=googleSync?.getConfig();$('google-url').value=config?.url||'';$('google-code').value=config?.token||'';$('google-error').textContent='';$('google-disconnect').hidden=!config;$('google-dialog').showModal();};
+$('google-cancel').onclick=()=>{if(!googleBusy){$('google-dialog').close();$('google-code').value='';}};
+$('google-dialog').addEventListener('cancel',event=>{event.preventDefault();$('google-cancel').click();});
+$('google-form').onsubmit=async event=>{event.preventDefault();if(googleBusy||!googleSync)return;googleBusy=true;$('google-connect').disabled=true;$('google-cancel').disabled=true;$('google-disconnect').disabled=true;$('google-error').textContent='';$('google-connect').textContent='Проверяем подключение…';try{await googleSync.connect({url:$('google-url').value.trim(),token:$('google-code').value.trim()});$('google-dialog').close();$('google-code').value='';toast('Google Таблица подключена');}catch(e){$('google-error').textContent=errorMessage(e);}finally{googleBusy=false;$('google-connect').disabled=false;$('google-cancel').disabled=false;$('google-disconnect').disabled=false;$('google-connect').textContent='Проверить и подключить';syncGoogle();}};
+$('google-disconnect').onclick=async()=>{if(googleBusy||!window.confirm('Отключить отправку в Google? Существующие записи останутся в таблице и в Telegram.'))return;try{await googleSync.disconnect();$('google-dialog').close();$('google-code').value='';toast('Синхронизация отключена');}catch(e){$('google-error').textContent=errorMessage(e);}};
+$('google-retry').onclick=syncGoogle;window.addEventListener('online',syncGoogle);document.addEventListener('visibilitychange',()=>{if(!document.hidden)syncGoogle();});
 window.addEventListener('beforeunload',event=>{if(busy||($('editor').open&&JSON.stringify(formValue())!==initial)){event.preventDefault();event.returnValue='';}});
 start();

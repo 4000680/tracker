@@ -5,13 +5,18 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Лаборатории — картотека</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="labs.css?v=1">
+  <link rel="stylesheet" href="labs.css?v=2">
 </head>
 <body>
 <main id="app">
   <a class="back" href="index.html">← Картотека</a>
   <header><span class="eyebrow">РАБОЧАЯ КАРТОТЕКА</span><h1>Лаборатории</h1><p>Контакты, условия работы и сотрудничество</p></header>
   <p id="storage" role="status">Загружаем записи…</p>
+  <section class="google-panel" aria-label="Google Таблица">
+    <div class="google-title"><strong>Google Таблица</strong><a href="https://docs.google.com/spreadsheets/d/1CFu2d_uNfeQIEBAiivHlWy-UIcPS2S7Srs5voW00s_Y/edit" target="_blank" rel="noopener noreferrer">Открыть таблицу ↗</a></div>
+    <p id="google-status" class="muted" role="status">Проверяем подключение…</p>
+    <div class="toolbar"><button id="google-settings" class="secondary" disabled>Подключить Google</button><button id="google-retry" class="secondary" disabled>Синхронизировать</button></div>
+  </section>
   <div class="toolbar">
     <button id="next" type="button" disabled>Начать обзвон</button>
     <button id="export" class="secondary" type="button" disabled>Скачать таблицу</button>
@@ -36,7 +41,17 @@
   <p id="edit-error" class="error" role="alert"></p>
   <div class="toolbar"><button id="save" type="submit">Сохранить</button><button id="cancel-edit" type="button" class="secondary">Отмена</button></div>
 </form></dialog>
+<dialog id="google-dialog"><form id="google-form" class="dialog-body">
+  <h2>Подключение таблицы</h2>
+  <p class="muted">Один раз настройте обработчик Google по <a href="google-sync/setup.html" target="_blank" rel="noopener noreferrer">пошаговой инструкции</a>. Затем вставьте его адрес и код подключения.</p>
+  <label for="google-url">Адрес веб-приложения Google</label><input id="google-url" type="url" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off" required>
+  <label for="google-code">Код подключения</label><input id="google-code" type="password" autocomplete="off" minlength="64" maxlength="64" required>
+  <p class="muted">Код вводится только здесь. После подключения уже внесённые записи тоже будут отправлены в таблицу. Изменения из Google Таблицы обратно в карточки не загружаются.</p>
+  <p id="google-error" class="error" role="alert"></p>
+  <div class="toolbar"><button id="google-connect" type="submit">Проверить и подключить</button><button id="google-cancel" type="button" class="secondary">Закрыть</button></div>
+  <button id="google-disconnect" type="button" class="secondary" hidden>Отключить синхронизацию</button>
+</form></dialog>
 <div id="toast" role="status" hidden></div>
-<script type="module" src="labs.js?v=1"></script>
+<script type="module" src="labs.js?v=2"></script>
 </body>
 </html>
