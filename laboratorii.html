@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Лаборатории — картотека</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="labs.css?v=1">
+</head>
+<body>
+<main id="app">
+  <a class="back" href="index.html">← Картотека</a>
+  <header><span class="eyebrow">РАБОЧАЯ КАРТОТЕКА</span><h1>Лаборатории</h1><p>Контакты, условия работы и сотрудничество</p></header>
+  <p id="storage" role="status">Загружаем записи…</p>
+  <div class="toolbar">
+    <button id="next" type="button" disabled>Начать обзвон</button>
+    <button id="export" class="secondary" type="button" disabled>Скачать таблицу</button>
+  </div>
+  <details class="transfer"><summary>Резервная копия и перенос</summary><p>Таблица выгружается в CSV для Excel и Google Таблиц. Для восстановления записей используйте резервную копию JSON.</p><div class="toolbar"><button id="backup" class="secondary" disabled>Скачать копию JSON</button><button id="restore" class="secondary" disabled>Загрузить копию JSON</button></div><input id="file" type="file" accept=".json,application/json" hidden></details>
+  <label class="search-label" for="search">Найти организацию</label>
+  <input id="search" type="search" placeholder="Название, телефон, город или ваши записи" autocomplete="off">
+  <label class="sr-only" for="filter">Статус обзвона</label>
+  <select id="filter"><option value="all">Все организации</option><option value="new">Ещё не звонили</option><option value="no_answer">Не дозвонились</option><option value="callback">Перезвонить</option><option value="talked">Обсудили</option><option value="closed">Неактуально</option></select>
+  <p id="count" class="muted" aria-live="polite"></p>
+  <section id="list" aria-label="Полный список лабораторий"></section>
+  <p class="source">Источник: список от 11.12.2024. Контакты и действующую область аккредитации уточняйте при звонке. Адреса, категории и цены заполняются вами.</p>
+</main>
+<dialog id="card"><div class="dialog-body">
+  <button id="close-card" class="close secondary" aria-label="Закрыть карточку">✕</button>
+  <div id="detail"></div>
+</div></dialog>
+<dialog id="editor"><form id="edit-form" class="dialog-body">
+  <h2 id="edit-title"></h2><p id="edit-hint" class="muted"></p>
+  <div id="text-editor"><label for="edit-text">Введите данные</label><textarea id="edit-text" rows="7" maxlength="3400"></textarea><span id="chars" class="muted"></span></div>
+  <div id="status-editor" hidden><label for="edit-status">Результат звонка</label><select id="edit-status"></select><label for="edit-date">Когда перезвонить</label><input id="edit-date" type="date"><label for="edit-contact">Контактное лицо / прямой номер</label><textarea id="edit-contact" rows="2" maxlength="1000"></textarea></div>
+  <p id="edit-error" class="error" role="alert"></p>
+  <div class="toolbar"><button id="save" type="submit">Сохранить</button><button id="cancel-edit" type="button" class="secondary">Отмена</button></div>
+</form></dialog>
+<div id="toast" role="status" hidden></div>
+<script type="module" src="labs.js?v=1"></script>
+</body>
+</html>
